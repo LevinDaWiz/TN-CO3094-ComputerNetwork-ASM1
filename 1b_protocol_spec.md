@@ -159,6 +159,3 @@ Mã: INVALID_CREDENTIALS, ALREADY_LOGGED_IN, INVALID_SESSION, USER_OFFLINE, NO_R
 
 Kiểm thử: encode/decode đúng 23 byte header; framing TCP bị chia/gộp; UDP mất/trùng/sai thứ tự; ACK mất; receiver window đầy; timeout; 10–20 client; chat khi truyền file; hash file rỗng/nhỏ/lớn; tag sai; logout/relogin không dùng khóa cũ.
 
-## 10. Phân công
-
-Người 1: codec, ACK/retry/window và scheduling. Người 2: server/session/presence/routing. Người 3: client điều phối và HTTP bridge. Người 4: file transfer. Người 5: UI và mã hóa, phối hợp người 2 về khóa phiên. Mọi thay đổi wire format phải sửa tài liệu này trước khi tích hợp.
