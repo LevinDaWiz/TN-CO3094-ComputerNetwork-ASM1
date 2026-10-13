@@ -1,94 +1,60 @@
-"""HTTP server cục bộ viết bằng socket thô, làm cầu nối giữa giao diện web và client.
+"""HTTP server cục bộ viết bằng socket thô, phục vụ giao diện web (1a_api.md).
 
-- Phục vụ tệp tĩnh trong web/ (giao diện của người 5).
-- API JSON cho đăng nhập, gửi tin, danh sách online, tệp (docs/api.md §3).
-- EventQueue + long-poll GET /api/events thay cho WebSocket (docs/api.md §4).
+- Phục vụ HTML/CSS/JS trong web/ (giao diện của người 5) và API JSON cùng origin.
+- Chỉ gọi facade ChatClient (client.py); không chạm tới TLS/UDP.
+- Request thay đổi trạng thái phải có X-Local-Token lấy từ GET /api/bootstrap.
 
-Chạy:  python3 http_bridge.py --mock            (server giả, không cần nhóm)
-       python3 http_bridge.py --server 127.0.0.1:9000
+Chạy:  python3 http_bridge.py --server-host 127.0.0.1 --ca-file <ca.pem>
 """
+from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import logging
 import mimetypes
 import os
+import re
+import secrets
 import socket
 import threading
-import time
-import uuid
-from collections import deque
 from dataclasses import dataclass
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from client import ChatClient, ClientError, make_real_transport
-from messaging import GLOBAL, Messenger
+from client import API_VERSION, MAX_FILE_SIZE, ChatClient, CursorExpired
+from protocol import AppError
 
-log = logging.getLogger("http_bridge")
+log = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAX_HEADER_BYTES = 16 * 1024
 MAX_JSON_BODY = 64 * 1024
-MAX_UPLOAD = 100 * 1024 * 1024
 SOCKET_TIMEOUT = 15.0
-DEFAULT_POLL_TIMEOUT = 25.0
-MAX_POLL_TIMEOUT = 30.0
-EVENT_QUEUE_SIZE = 1000
+MAX_POLL_TIMEOUT = 25.0
 CHUNK = 64 * 1024
 
-STATUS_TEXT = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
-               404: "Not Found", 415: "Unsupported Media Type",
+STATUS_TEXT = {200: "OK", 201: "Created", 202: "Accepted", 400: "Bad Request",
+               401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
                405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large",
-               500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway"}
+               500: "Internal Server Error", 501: "Not Implemented",
+               503: "Service Unavailable"}
 
-# Mã lỗi của client.py → HTTP status (docs/api.md §2).
-CLIENT_ERROR_STATUS = {"NOT_ONLINE": 409, "ALREADY_ONLINE": 409, "BUSY": 409,
-                       "AUTH_FAILED": 401, "SERVER_UNREACHABLE": 502}
+# AppError.code → HTTP status (1a_api.md §1). Mã không có trong bảng là lỗi đầu vào → 400.
+ERROR_STATUS = {
+    "NOT_AUTHENTICATED": 401,
+    "FORBIDDEN": 403, "INVALID_LOCAL_TOKEN": 403,
+    "NOT_FOUND": 404, "TRANSFER_NOT_FOUND": 404,
+    "INVALID_STATE": 409, "USER_OFFLINE": 409, "EVENT_CURSOR_EXPIRED": 409,
+    "TRANSFER_NOT_COMPLETED": 409,
+    "PAYLOAD_TOO_LARGE": 413, "FILE_TOO_LARGE": 413,
+    "NOT_IMPLEMENTED": 501,
+    "SERVER_UNAVAILABLE": 503, "QUEUE_FULL": 503, "TRANSPORT_CLOSED": 503,
+    # Từ ReliableUDP khi peer vừa bị đóng / hết bộ đếm, trước khi client kịp về disconnected.
+    "INVALID_SESSION": 503, "STREAM_CLOSED": 503, "SESSION_EXHAUSTED": 503,
+}
 
-
-# ============================================================================
-# Hàng đợi sự kiện
-# ============================================================================
-
-class EventQueue:
-    """Sự kiện đánh số tăng dần; JS long-poll lấy các sự kiện có seq > since."""
-
-    def __init__(self, maxlen: int = EVENT_QUEUE_SIZE):
-        self._events: deque = deque(maxlen=maxlen)
-        self._seq = 0
-        self._cond = threading.Condition()
-
-    @property
-    def last_seq(self) -> int:
-        with self._cond:
-            return self._seq
-
-    def push(self, type_: str, data: dict) -> int:
-        """Thêm sự kiện; an toàn khi gọi từ bất kỳ luồng nào."""
-        with self._cond:
-            self._seq += 1
-            self._events.append({"seq": self._seq, "type": type_, "ts": time.time(), "data": data})
-            self._cond.notify_all()
-            return self._seq
-
-    def wait_since(self, since: int, timeout: float) -> tuple[list[dict], int, bool]:
-        """Chờ tới khi có sự kiện mới hơn `since` hoặc hết timeout.
-
-        Trả về (events, next, reset). reset=True khi `since` không còn khớp với hàng
-        đợi (bridge khởi động lại, hoặc JS tụt quá xa nên đã mất sự kiện cũ).
-        """
-        deadline = time.monotonic() + timeout
-        with self._cond:
-            if since > self._seq:
-                return [], self._seq, True
-            while self._seq <= since:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return [], since, False
-                self._cond.wait(remaining)
-            reset = since < self._events[0]["seq"] - 1
-            events = [e for e in self._events if e["seq"] > since]
-            return events, self._seq, reset
+TRANSFER_ID = r"(?P<transfer_id>[A-Za-z0-9-]{1,64})"
 
 
 # ============================================================================
@@ -96,9 +62,9 @@ class EventQueue:
 # ============================================================================
 
 class HttpError(Exception):
-    def __init__(self, status: int, code: str, message: str):
+    def __init__(self, status: int, code: str, message: str, extra: dict | None = None):
         super().__init__(message)
-        self.status, self.code, self.message = status, code, message
+        self.status, self.code, self.message, self.extra = status, code, message, extra or {}
 
 
 @dataclass
@@ -119,29 +85,25 @@ class Request:
         self.path = unquote(split.path)
         self.query = {k: v[-1] for k, v in parse_qs(split.query).items()}
         self._leftover = leftover           # phần body đã đọc lẫn cùng header
-        self._body_read = False
+        self.body_read = False
 
     @property
     def content_length(self) -> int:
         if "chunked" in self.headers.get("transfer-encoding", "").lower():
-            raise HttpError(400, "BAD_REQUEST", "Không hỗ trợ Transfer-Encoding: chunked")
+            raise HttpError(400, "INVALID_INPUT", "Không hỗ trợ Transfer-Encoding: chunked")
         raw = self.headers.get("content-length", "0")
-        try:
-            n = int(raw)
-        except ValueError:
-            raise HttpError(400, "BAD_REQUEST", "Content-Length không hợp lệ")
-        if n < 0:
-            raise HttpError(400, "BAD_REQUEST", "Content-Length không hợp lệ")
-        return n
+        if not (raw.isascii() and raw.isdigit()):
+            raise HttpError(400, "INVALID_INPUT", "Content-Length không hợp lệ")
+        return int(raw)
 
     def iter_body(self, limit: int):
         """Đọc body theo từng khúc, dừng đúng ở Content-Length."""
-        if self._body_read:
+        if self.body_read:
             return
-        self._body_read = True
+        self.body_read = True
         remaining = self.content_length
         if remaining > limit:
-            raise HttpError(413, "TOO_LARGE", f"Body vượt quá {limit} byte")
+            raise HttpError(413, "PAYLOAD_TOO_LARGE", f"Body vượt quá {limit} byte")
         if self._leftover:
             chunk, self._leftover = self._leftover[:remaining], b""
             remaining -= len(chunk)
@@ -149,38 +111,30 @@ class Request:
         while remaining > 0:
             chunk = self.conn.recv(min(CHUNK, remaining))
             if not chunk:
-                raise HttpError(400, "BAD_REQUEST", "Kết nối đóng khi chưa gửi đủ body")
+                raise HttpError(400, "INVALID_INPUT", "Kết nối đóng khi chưa gửi đủ body")
             remaining -= len(chunk)
             yield chunk
 
-    def drain(self, limit: int = MAX_UPLOAD) -> None:
-        """Đọc bỏ body trước khi trả lỗi; nếu không, đóng socket khi còn dữ liệu chưa
-        đọc sẽ gửi RST và trình duyệt có thể không nhận được response lỗi."""
-        try:
-            for _ in self.iter_body(limit):
-                pass
-        except (HttpError, OSError):
-            pass
-
-    def read_body(self, limit: int = MAX_JSON_BODY) -> bytes:
-        return b"".join(self.iter_body(limit))
-
     def json(self) -> dict:
-        # Bắt buộc application/json: form HTML của trang web khác không gửi được kiểu này
-        # nếu không qua preflight CORS (mà bridge không hỗ trợ) → chặn CSRF.
-        ctype = self.headers.get("content-type", "").split(";")[0].strip().lower()
-        if self.content_length and ctype != "application/json":
-            raise HttpError(415, "BAD_REQUEST", "Content-Type phải là application/json")
-        body = self.read_body(MAX_JSON_BODY)
+        body = b"".join(self.iter_body(MAX_JSON_BODY))
         if not body.strip():
             return {}
         try:
             data = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise HttpError(400, "BAD_REQUEST", "Body không phải JSON hợp lệ")
+            raise HttpError(400, "INVALID_INPUT", "Body không phải JSON hợp lệ")
         if not isinstance(data, dict):
-            raise HttpError(400, "BAD_REQUEST", "Body JSON phải là object")
+            raise HttpError(400, "INVALID_INPUT", "Body JSON phải là object")
         return data
+
+    def drain(self) -> None:
+        """Đọc bỏ body còn lại trước khi trả lỗi; đóng socket khi còn dữ liệu chưa đọc
+        sẽ gửi RST và trình duyệt có thể không nhận được response lỗi."""
+        try:
+            for _ in self.iter_body(MAX_FILE_SIZE):
+                pass
+        except (HttpError, OSError):
+            pass
 
 
 def read_request(conn: socket.socket) -> Request | None:
@@ -188,28 +142,28 @@ def read_request(conn: socket.socket) -> Request | None:
     buf = b""
     while b"\r\n\r\n" not in buf:
         if len(buf) > MAX_HEADER_BYTES:
-            raise HttpError(400, "BAD_REQUEST", "Header quá lớn")
+            raise HttpError(400, "INVALID_INPUT", "Header quá lớn")
         chunk = conn.recv(4096)
         if not chunk:
             if buf:
-                raise HttpError(400, "BAD_REQUEST", "Request bị cắt ngang")
+                raise HttpError(400, "INVALID_INPUT", "Request bị cắt ngang")
             return None
         buf += chunk
     head, leftover = buf.split(b"\r\n\r\n", 1)
     if len(head) > MAX_HEADER_BYTES:
-        raise HttpError(400, "BAD_REQUEST", "Header quá lớn")
+        raise HttpError(400, "INVALID_INPUT", "Header quá lớn")
 
     lines = head.decode("iso-8859-1").split("\r\n")
     parts = lines[0].split(" ")
     if len(parts) != 3 or not parts[2].startswith("HTTP/"):
-        raise HttpError(400, "BAD_REQUEST", "Request line không hợp lệ")
+        raise HttpError(400, "INVALID_INPUT", "Request line không hợp lệ")
     method, target, _version = parts
 
     headers = {}
     for line in lines[1:]:
         name, sep, value = line.partition(":")
         if not sep:
-            raise HttpError(400, "BAD_REQUEST", "Header không hợp lệ")
+            raise HttpError(400, "INVALID_INPUT", "Header không hợp lệ")
         headers[name.strip().lower()] = value.strip()
     return Request(conn, method.upper(), target, headers, leftover)
 
@@ -221,14 +175,10 @@ def _head_bytes(status: int, headers: list[tuple[str, str]]) -> bytes:
     return "\r\n".join(lines).encode("iso-8859-1")
 
 
-def send_bytes(conn: socket.socket, status: int, body: bytes, content_type: str) -> None:
-    conn.sendall(_head_bytes(status, [("Content-Type", content_type),
-                                      ("Content-Length", str(len(body)))]) + body)
-
-
 def send_json(conn: socket.socket, status: int, payload: dict) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    send_bytes(conn, status, body, "application/json; charset=utf-8")
+    conn.sendall(_head_bytes(status, [("Content-Type", "application/json; charset=utf-8"),
+                                      ("Content-Length", str(len(body)))]) + body)
 
 
 def send_file(conn: socket.socket, result: FileResult, f) -> None:
@@ -243,14 +193,6 @@ def send_file(conn: socket.socket, result: FileResult, f) -> None:
         conn.sendall(chunk)
 
 
-def ok(data) -> tuple[int, dict]:
-    return 200, {"ok": True, "data": data, "error": None}
-
-
-def error_payload(code: str, message: str) -> dict:
-    return {"ok": False, "data": None, "error": {"code": code, "message": message}}
-
-
 def guess_type(path: str) -> str:
     ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
     if ctype.startswith("text/") or ctype in ("application/javascript", "application/json"):
@@ -258,11 +200,26 @@ def guess_type(path: str) -> str:
     return ctype
 
 
-def safe_filename(name: str) -> str:
-    """Bỏ đường dẫn và ký tự điều khiển khỏi tên tệp người dùng gửi lên."""
-    name = os.path.basename(name.replace("\\", "/"))
-    name = "".join(ch for ch in name if ch.isprintable()).strip().lstrip(".")
-    return name[:200] or "file"
+def _int_param(query: dict, name: str, default: int) -> int:
+    raw = query.get(name, "")
+    if raw == "":
+        return default
+    if not (raw.isascii() and raw.isdigit()):
+        raise HttpError(400, "INVALID_INPUT", f"'{name}' phải là số nguyên ≥ 0")
+    return int(raw)
+
+
+def _float_param(query: dict, name: str, default: float, hi: float) -> float:
+    raw = query.get(name, "")
+    if raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not 0 <= value <= hi:  # cũng loại NaN
+        raise HttpError(400, "INVALID_INPUT", f"'{name}' phải trong khoảng 0–{hi:g}")
+    return value
 
 
 # ============================================================================
@@ -270,29 +227,31 @@ def safe_filename(name: str) -> str:
 # ============================================================================
 
 class HttpBridge:
-    def __init__(self, client: ChatClient, messenger: Messenger, events: EventQueue,
-                 host: str = "127.0.0.1", port: int = 8080,
-                 static_dir: str = os.path.join(BASE_DIR, "web"),
-                 upload_dir: str = os.path.join(BASE_DIR, "uploads")):
+    def __init__(self, client: ChatClient, host: str = "127.0.0.1", port: int = 8080,
+                 static_dir: str = os.path.join(BASE_DIR, "web")):
         self.client = client
-        self.messenger = messenger
-        self.events = events
         self.host, self.port = host, port
         self.static_dir = os.path.realpath(static_dir)
-        self.upload_dir = upload_dir
+        self.local_token = secrets.token_urlsafe(32)
         self._sock: socket.socket | None = None
         self._stopping = threading.Event()
 
-        self.routes = {
-            ("GET", "/api/status"): self.h_status,
-            ("POST", "/api/login"): self.h_login,
-            ("POST", "/api/logout"): self.h_logout,
-            ("GET", "/api/users"): self.h_users,
-            ("GET", "/api/messages"): self.h_get_messages,
-            ("POST", "/api/messages"): self.h_send_message,
-            ("GET", "/api/events"): self.h_events,
-            ("POST", "/api/files"): self.h_upload,
-        }
+        routes = [
+            ("GET", "/api/bootstrap", self.h_bootstrap),
+            ("POST", "/api/login", self.h_login),
+            ("POST", "/api/logout", self.h_logout),
+            ("GET", "/api/status", self.h_status),
+            ("GET", "/api/users", self.h_users),
+            ("POST", "/api/messages", self.h_send_message),
+            ("GET", "/api/events", self.h_events),
+            ("POST", "/api/files/offers", self.h_create_offer),
+            ("GET", "/api/files", self.h_list_files),
+            ("PUT", f"/api/files/{TRANSFER_ID}/content", self.h_upload_content),
+            ("POST", f"/api/files/{TRANSFER_ID}/accept", self.h_accept),
+            ("POST", f"/api/files/{TRANSFER_ID}/reject", self.h_reject),
+            ("GET", f"/api/files/{TRANSFER_ID}/download", self.h_download),
+        ]
+        self.routes = [(method, re.compile(pattern), handler) for method, pattern, handler in routes]
 
     # ---- vòng accept --------------------------------------------------------
 
@@ -325,6 +284,7 @@ class HttpBridge:
 
     def _handle_conn(self, conn: socket.socket) -> None:
         conn.settimeout(SOCKET_TIMEOUT)
+        req = None
         responded = False
         try:
             req = read_request(conn)
@@ -341,26 +301,33 @@ class HttpBridge:
                     responded = True
                     send_file(conn, result, f)
             else:
+                status, data = result
                 responded = True
-                send_json(conn, *result)
+                send_json(conn, status, {"ok": True, "data": data})
         except HttpError as e:
             if not responded:
-                self._try_send(conn, e.status, error_payload(e.code, e.message))
+                if req is not None:
+                    req.drain()
+                self._send_error(conn, e)
         except (socket.timeout, ConnectionError):
             pass  # trình duyệt đóng tab / mạng chậm: bỏ qua
         except Exception:
             log.exception("Lỗi xử lý request")
             if not responded:
-                self._try_send(conn, 500, error_payload("INTERNAL", "Lỗi nội bộ"))
+                self._send_error(conn, HttpError(500, "INTERNAL", "Lỗi nội bộ"))
         finally:
             conn.close()
 
-    def _check_origin(self, req: Request) -> None:
-        """Chặn trang web lạ gọi API qua trình duyệt của người dùng.
+    @staticmethod
+    def _send_error(conn, e: HttpError) -> None:
+        try:
+            send_json(conn, e.status, {"ok": False, "error": {"code": e.code,
+                                                              "message": e.message, **e.extra}})
+        except OSError:
+            pass
 
-        - Host phải là địa chỉ của bridge (chống DNS rebinding).
-        - Request có Origin (trình duyệt gửi khi cross-site / POST) phải cùng origin.
-        """
+    def _check_origin(self, req: Request) -> None:
+        """Host phải là địa chỉ của bridge (chống DNS rebinding); Origin nếu có phải cùng origin."""
         allowed = {f"{h}:{self.port}" for h in ("127.0.0.1", "localhost", self.host)}
         host = req.headers.get("host", "").lower()
         if host not in allowed:
@@ -369,12 +336,10 @@ class HttpBridge:
         if origin is not None and urlsplit(origin).netloc.lower() != host:
             raise HttpError(403, "FORBIDDEN", "Origin không hợp lệ")
 
-    @staticmethod
-    def _try_send(conn, status, payload) -> None:
-        try:
-            send_json(conn, status, payload)
-        except OSError:
-            pass
+    def _check_token(self, req: Request) -> None:
+        token = req.headers.get("x-local-token", "")
+        if not hmac.compare_digest(token.encode(), self.local_token.encode()):
+            raise HttpError(403, "INVALID_LOCAL_TOKEN", "Local token sai hoặc thiếu")
 
     def _route(self, req: Request):
         if not req.path.startswith("/api/"):
@@ -382,25 +347,25 @@ class HttpBridge:
                 raise HttpError(405, "METHOD_NOT_ALLOWED", "Chỉ hỗ trợ GET cho tệp tĩnh")
             return self._static(req.path)
 
-        if req.path.startswith("/api/files/"):
-            if req.method != "GET":
-                raise HttpError(405, "METHOD_NOT_ALLOWED", "Chỉ hỗ trợ GET")
-            handler = lambda r: self.h_download(r, r.path[len("/api/files/"):])  # noqa: E731
-        else:
-            handler = self.routes.get((req.method, req.path))
-            if handler is None:
-                if any(path == req.path for _, path in self.routes):
-                    raise HttpError(405, "METHOD_NOT_ALLOWED", f"{req.method} không hỗ trợ")
-                raise HttpError(404, "NOT_FOUND", "Không có endpoint này")
-
-        try:
-            return handler(req)
-        except ClientError as e:
-            raise HttpError(CLIENT_ERROR_STATUS.get(e.code, 500), e.code, str(e))
-        except NotImplementedError as e:
-            raise HttpError(501, "NOT_IMPLEMENTED", str(e) or "Tính năng chưa có")
-        except ValueError as e:
-            raise HttpError(400, "BAD_REQUEST", str(e))
+        path_exists = False
+        for method, pattern, handler in self.routes:
+            match = pattern.fullmatch(req.path)
+            if match is None:
+                continue
+            path_exists = True
+            if method != req.method:
+                continue
+            if method != "GET":
+                self._check_token(req)
+            try:
+                return handler(req, **match.groupdict())
+            except CursorExpired as e:
+                raise HttpError(409, e.code, e.message, {"current_cursor": e.current_cursor})
+            except AppError as e:
+                raise HttpError(ERROR_STATUS.get(e.code, 400), e.code, e.message)
+        if path_exists:
+            raise HttpError(405, "METHOD_NOT_ALLOWED", f"{req.method} không hỗ trợ")
+        raise HttpError(404, "NOT_FOUND", "Không có endpoint này")
 
     def _static(self, path: str) -> FileResult:
         rel = path.removeprefix("/static/").lstrip("/") or "index.html"
@@ -410,187 +375,119 @@ class HttpBridge:
             raise HttpError(404, "NOT_FOUND", "Không tìm thấy tệp")
         return FileResult(full, guess_type(full))
 
-    # ---- endpoint -----------------------------------------------------------
+    # ---- endpoint: phiên và tin nhắn ---------------------------------------
 
-    def h_status(self, req):
-        return ok({**self.client.status(), "last_seq": self.events.last_seq})
+    def h_bootstrap(self, req):
+        return 200, {"local_token": self.local_token, "api_version": API_VERSION}
 
     def h_login(self, req):
         body = req.json()
-        username = body.get("username")
-        password = body.get("password", "")
-        if password is None:
-            password = ""
-        users = self.client.login(username, password)
-        return ok({"username": self.client.username, "state": self.client.state.value,
-                   "users": users})
+        self.client.login(body.get("username"), body.get("password"))
+        return 202, {"status": "connecting"}
 
     def h_logout(self, req):
-        req.read_body()
-        self.client.logout()
-        self.messenger.reset()
-        return ok({"state": self.client.state.value})
+        req.json()
+        state = self.client.logout()
+        return (200 if state == "disconnected" else 202), {"status": state}
+
+    def h_status(self, req):
+        return 200, self.client.get_status()
 
     def h_users(self, req):
-        return ok({"users": self.client.online_users})
-
-    def h_get_messages(self, req):
-        peer = req.query.get("peer") or GLOBAL
-        limit = _int_param(req.query, "limit", 50, 1, 500)
-        return ok({"messages": [m.to_dict() for m in self.messenger.store.history(peer, limit)]})
+        return 200, self.client.list_users()
 
     def h_send_message(self, req):
         body = req.json()
-        to = body.get("to")
-        text = body.get("text")
-        if to is not None and not isinstance(to, str):
-            raise ValueError("'to' phải là chuỗi hoặc null")
-        if not isinstance(text, str):
-            raise ValueError("Thiếu 'text'")
-        if to and to == self.client.username:
-            raise ValueError("Không thể nhắn riêng cho chính mình")
-        msg = self.messenger.send(to or None, text)
-        return ok({"message": msg.to_dict()})
+        message_id = self.client.send_message(body.get("to"), body.get("text"))
+        return 202, {"message_id": message_id, "status": "queued"}
 
     def h_events(self, req):
-        since = _int_param(req.query, "since", 0, 0, None)
-        timeout = _float_param(req.query, "timeout", DEFAULT_POLL_TIMEOUT, 0, MAX_POLL_TIMEOUT)
-        events, next_seq, reset = self.events.wait_since(since, timeout)
-        return ok({"events": events, "next": next_seq, "reset": reset})
+        # timeout là phần mở rộng (long-poll); mặc định 0 = polling thường như 1a_api.md.
+        after = _int_param(req.query, "after", 0)
+        timeout = _float_param(req.query, "timeout", 0.0, MAX_POLL_TIMEOUT)
+        return 200, self.client.get_events(after, timeout=timeout)
 
-    def h_upload(self, req):
-        try:
-            if self.client.file_service is None:
-                raise NotImplementedError("file_transfer.py chưa sẵn sàng")
-            self.client.require_online()
-            if "x-filename" not in req.headers:
-                raise ValueError("Thiếu header X-Filename")
-            filename = safe_filename(unquote(req.headers["x-filename"]))
-            to = unquote(req.headers.get("x-to", "")).strip() or None
-            if to and to == self.client.username:
-                raise ValueError("Không thể gửi tệp cho chính mình")
-            if req.content_length > MAX_UPLOAD:
-                raise HttpError(413, "TOO_LARGE",
-                                f"Tệp vượt quá {MAX_UPLOAD // (1024 * 1024)} MB")
-        except Exception:
-            req.drain()
-            raise
+    # ---- endpoint: tệp ---------------------------------------------------------
 
-        os.makedirs(self.upload_dir, exist_ok=True)
-        path = os.path.join(self.upload_dir, f"{uuid.uuid4().hex}_{filename}")
-        size = 0
+    def h_create_offer(self, req):
+        body = req.json()
+        transfer_id = self.client.create_upload(body.get("to"), body.get("filename"),
+                                                body.get("size"))
+        return 201, {"transfer_id": transfer_id, "status": "awaiting_upload"}
+
+    def h_list_files(self, req):
+        return 200, {"transfers": self.client.list_transfers()}
+
+    def h_upload_content(self, req, transfer_id):
+        if "content-length" not in req.headers:
+            raise HttpError(400, "INVALID_INPUT", "Thiếu Content-Length")
+        length = req.content_length
+        if length > MAX_FILE_SIZE:
+            raise HttpError(413, "FILE_TOO_LARGE", "Tệp vượt quá 100 MiB")
+        path = self.client.begin_upload(transfer_id, length)
+
+        # Ghi thẳng xuống tệp tạm và băm SHA-256 theo từng khúc, không nạp cả tệp vào RAM.
+        digest = hashlib.sha256()
         try:
             with open(path, "wb") as f:
-                for chunk in req.iter_body(MAX_UPLOAD):
+                for chunk in req.iter_body(MAX_FILE_SIZE):
                     f.write(chunk)
-                    size += len(chunk)
-        except BaseException:
-            _remove_quietly(path)
+                    digest.update(chunk)
+            self.client.submit_uploaded_file(transfer_id, path, digest.hexdigest())
+        except BaseException as e:
+            self.client.abort_upload(transfer_id, getattr(e, "code", "IO_ERROR"))
             raise
+        return 202, {"transfer_id": transfer_id, "status": "offered"}
 
-        # ⏳ PENDING: file_transfer.py thật sẽ nhận (path, filename, to) và chạy nền.
-        transfer_id = self.client.file_service.send_file(path, filename, to)
-        return ok({"transfer_id": transfer_id, "filename": filename, "size": size})
+    def h_accept(self, req, transfer_id):
+        req.json()
+        self.client.accept_transfer(transfer_id)
+        return 202, {"transfer_id": transfer_id, "status": "accepted"}
 
-    def h_download(self, req, transfer_id: str):
-        if self.client.file_service is None:
-            raise NotImplementedError("file_transfer.py chưa sẵn sàng")
-        found = self.client.file_service.get_received(transfer_id)
-        if not found or not os.path.isfile(found[0]):
-            raise HttpError(404, "NOT_FOUND", "Không có tệp này hoặc chưa nhận xong")
-        path, filename = found
-        return FileResult(path, guess_type(filename), download_name=filename)
+    def h_reject(self, req, transfer_id):
+        reason = req.json().get("reason") or "Không nhận tệp"
+        if not isinstance(reason, str):
+            raise HttpError(400, "INVALID_INPUT", "'reason' phải là chuỗi")
+        self.client.reject_transfer(transfer_id, reason)
+        return 202, {"transfer_id": transfer_id, "status": "rejected"}
 
-
-def _int_param(query: dict, name: str, default: int, lo: int, hi: int | None) -> int:
-    raw = query.get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        raise ValueError(f"'{name}' phải là số nguyên")
-    if value < lo:
-        raise ValueError(f"'{name}' phải ≥ {lo}")
-    return min(value, hi) if hi is not None else value
-
-
-def _float_param(query: dict, name: str, default: float, lo: float, hi: float) -> float:
-    raw = query.get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        raise ValueError(f"'{name}' phải là số")
-    if not lo <= value <= hi:  # cũng loại NaN
-        raise ValueError(f"'{name}' phải trong khoảng {lo}–{hi}")
-    return value
-
-
-def _remove_quietly(path: str) -> None:
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+    def h_download(self, req, transfer_id):
+        path = self.client.get_download_path(transfer_id)
+        return FileResult(path, "application/octet-stream",
+                          download_name=os.path.basename(path))
 
 
 # ============================================================================
 # main
 # ============================================================================
 
-def parse_addr(text: str) -> tuple[str, int]:
-    host, sep, port = text.rpartition(":")
-    if not sep or not host or not port.isdigit():
-        raise argparse.ArgumentTypeError("Dạng host:port, ví dụ 127.0.0.1:9000")
-    return host, int(port)
-
-
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Client chat + HTTP bridge cho giao diện web")
-    ap.add_argument("--server", type=parse_addr, default=("127.0.0.1", 9000),
-                    help="địa chỉ server chat (mặc định 127.0.0.1:9000)")
+    ap = argparse.ArgumentParser(description="Python client + HTTP bridge cho giao diện web")
+    ap.add_argument("--server-host", default="127.0.0.1", help="địa chỉ server chat")
+    ap.add_argument("--tcp-port", type=int, default=9000, help="cổng TCP/TLS đăng nhập")
+    ap.add_argument("--ca-file", help="chứng chỉ CA để xác minh TLS của server")
+    ap.add_argument("--server-name", help="tên trong chứng chỉ server (mặc định = --server-host)")
     ap.add_argument("--http-host", default="127.0.0.1")
     ap.add_argument("--http-port", type=int, default=8080)
     ap.add_argument("--web-dir", default=os.path.join(BASE_DIR, "web"))
-    ap.add_argument("--upload-dir", default=os.path.join(BASE_DIR, "uploads"))
-    ap.add_argument("--mock", action="store_true",
-                    help="dùng server/file transfer giả trong dev_mock.py")
-    ap.add_argument("--mock-fail-rate", type=float, default=0.0,
-                    help="tỉ lệ bỏ MSG_ACK khi --mock, để thử trạng thái FAILED")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    events = EventQueue()
-    if args.mock:
-        try:
-            from dev_mock import MockFileService, MockServerTransport
-        except ImportError:
-            ap.error("--mock cần dev_mock.py (file chỉ dùng khi dev, không có trong repo)")
-        transport_factory = lambda: MockServerTransport(fail_rate=args.mock_fail_rate)  # noqa: E731
-    else:
-        transport_factory = make_real_transport
+    client = ChatClient(args.server_host, args.tcp_port, ca_file=args.ca_file,
+                        server_hostname=args.server_name)
+    # ⏳ khi file_transfer.py xong: client.attach_file_service(FileTransfer(client, ...))
 
-    client = ChatClient(args.server, transport_factory, on_event=events.push)
-    messenger = Messenger(client, on_event=events.push)
-    if args.mock:
-        client.file_service = MockFileService(events.push,
-                                              download_dir=os.path.join(BASE_DIR, "downloads"))
-    # ⏳ PENDING: khi file_transfer.py xong → client.file_service = FileTransferService(...)
-
-    bridge = HttpBridge(client, messenger, events, args.http_host, args.http_port,
-                        static_dir=args.web_dir, upload_dir=args.upload_dir)
+    bridge = HttpBridge(client, args.http_host, args.http_port, static_dir=args.web_dir)
     try:
         bridge.serve_forever()
     except KeyboardInterrupt:
         log.info("Đang tắt...")
     finally:
         bridge.shutdown()
-        client.logout()
-        messenger.shutdown()
+        client.close()
 
 
 if __name__ == "__main__":

@@ -1,206 +1,142 @@
-"""Gửi/nhận tin nhắn chung (broadcast) và riêng (unicast), theo dõi trạng thái gửi.
+"""Tin nhắn chung/riêng trên stream 2 (1b_protocol_spec.md §6).
 
-Lớp xử lý dữ liệu: không đụng tới socket. Gửi packet qua ChatClient, nhận packet
-qua handler mà ChatClient gọi từ luồng nhận. Mọi thay đổi được báo lên giao diện
-qua callback on_event(type, data) — xem docs/api.md §4.
+Không đụng tới socket: gửi qua ChatClient.send_reliable(), nhận CHAT / CHAT_STATUS /
+ERROR do luồng worker của ChatClient chuyển tới, báo giao diện qua ChatClient.emit().
+
+Trạng thái tin gửi đi: queued (cục bộ) → accepted (server nhận) → delivered (client
+đích ACK), hoặc failed. Tin global có trạng thái riêng cho từng recipient_id.
 """
+from __future__ import annotations
 
+import logging
 import threading
-import time
 import uuid
-from dataclasses import asdict, dataclass, field
-from enum import Enum
+from collections import OrderedDict, deque
 
-GLOBAL = "global"          # khoá hội thoại cho kênh chung
-MAX_TEXT_LEN = 4000
-ACK_TIMEOUT = 10.0         # giây chờ MSG_ACK từ server trước khi coi là FAILED
-HISTORY_LIMIT = 500        # số tin giữ lại cho mỗi hội thoại
+from protocol import AppError, PacketType, encode_json
 
+log = logging.getLogger(__name__)
 
-class MessageStatus(str, Enum):
-    PENDING = "PENDING"    # vừa tạo, chưa giao cho transport
-    SENT = "SENT"          # transport đã nhận, đang chờ server xác nhận
-    ACKED = "ACKED"        # server đã nhận và chuyển tiếp
-    FAILED = "FAILED"      # transport lỗi, server từ chối hoặc quá ACK_TIMEOUT
+CHAT_STREAM = 2
+MAX_TEXT_BYTES = 800
+MAX_ID_LEN = 64
+TRACK_LIMIT = 10000             # số tin gửi đi / tin nhận được nhớ để theo dõi và chống trùng
 
-
-@dataclass
-class Message:
-    sender: str
-    to: str | None         # None = tin chung
-    text: str
-    msg_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    ts: float = field(default_factory=time.time)
-    status: MessageStatus = MessageStatus.PENDING
-    direction: str = "out"  # "out" = mình gửi, "in" = nhận
-
-    def peer(self, me: str) -> str:
-        """Khoá hội thoại nhìn từ phía `me`: 'global' hoặc tên người bên kia."""
-        if self.to is None:
-            return GLOBAL
-        return self.to if self.sender == me else self.sender
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        d["status"] = self.status.value
-        return d
+SERVER_STATUSES = ("accepted", "delivered", "failed")
+FINAL_STATUSES = ("delivered", "failed")
 
 
-class MessageStore:
-    """Lịch sử tin nhắn trong RAM, an toàn khi dùng từ nhiều luồng."""
-
-    def __init__(self, limit: int = HISTORY_LIMIT):
-        self._limit = limit
-        self._lock = threading.Lock()
-        self._by_peer: dict[str, list[Message]] = {}
-        self._by_id: dict[str, Message] = {}
-
-    def add(self, msg: Message, me: str) -> None:
-        with self._lock:
-            conv = self._by_peer.setdefault(msg.peer(me), [])
-            conv.append(msg)
-            self._by_id[msg.msg_id] = msg
-            if len(conv) > self._limit:
-                dropped = conv.pop(0)
-                self._by_id.pop(dropped.msg_id, None)
-
-    def get(self, msg_id: str) -> Message | None:
-        with self._lock:
-            return self._by_id.get(msg_id)
-
-    def set_status(self, msg_id: str, status: MessageStatus) -> Message | None:
-        """Đổi trạng thái tin gửi đi. Trả về tin nếu có thay đổi, None nếu không.
-
-        Không cho lùi trạng thái: tin đã ACKED/FAILED thì giữ nguyên (ví dụ MSG_ACK
-        đến muộn sau khi đã timeout).
-        """
-        with self._lock:
-            msg = self._by_id.get(msg_id)
-            if msg is None or msg.status in (MessageStatus.ACKED, MessageStatus.FAILED):
-                return None
-            msg.status = status
-            return msg
-
-    def history(self, peer: str = GLOBAL, limit: int = 50) -> list[Message]:
-        with self._lock:
-            return list(self._by_peer.get(peer, [])[-limit:])
-
-    def clear(self) -> None:
-        with self._lock:
-            self._by_peer.clear()
-            self._by_id.clear()
+def _is_id(value) -> bool:
+    return isinstance(value, str) and 1 <= len(value) <= MAX_ID_LEN
 
 
 class Messenger:
-    """Cầu nối giữa ChatClient (packet) và giao diện (Message + sự kiện)."""
-
-    def __init__(self, client, on_event=None, ack_timeout: float = ACK_TIMEOUT):
+    def __init__(self, client):
         self.client = client
-        self.store = MessageStore()
-        self._on_event = on_event or (lambda type_, data: None)
-        self._ack_timeout = ack_timeout
-        self._timers: dict[str, threading.Timer] = {}
-        self._timers_lock = threading.Lock()
+        self._lock = threading.Lock()
+        # message_id → {recipient_id (None = cả tin): status}
+        self._outgoing: OrderedDict[str, dict] = OrderedDict()
+        self._seen: set[tuple[str, str]] = set()
+        self._seen_order: deque = deque()
 
-        client.register_handler("MSG", self._on_msg)
-        client.register_handler("MSG_ACK", self._on_msg_ack)
-        client.register_handler("MSG_FAIL", self._on_msg_fail)
+    # ---- gửi --------------------------------------------------------------------
 
-    # ---- gửi -------------------------------------------------------------
-
-    def send_global(self, text: str) -> Message:
-        return self.send(None, text)
-
-    def send_private(self, to: str, text: str) -> Message:
-        if not to:
-            raise ValueError("Thiếu người nhận")
-        return self.send(to, text)
-
-    def send(self, to: str | None, text: str) -> Message:
-        """Gửi tin; trả về ngay sau khi giao cho transport (status SENT hoặc FAILED).
-
-        Raise ValueError nếu nội dung không hợp lệ, NotOnlineError nếu chưa đăng nhập.
-        """
-        text = (text or "").strip()
-        if not text:
-            raise ValueError("Tin nhắn rỗng")
-        if len(text) > MAX_TEXT_LEN:
-            raise ValueError(f"Tin nhắn dài quá {MAX_TEXT_LEN} ký tự")
-        self.client.require_online()
-
-        me = self.client.username
-        msg = Message(sender=me, to=to or None, text=text)
-        self.store.add(msg, me)
-
-        packet = {"type": "MSG", "msg_id": msg.msg_id, "to": msg.to,
-                  "text": msg.text, "ts": msg.ts}
+    def send_message(self, to: str | None, text: str) -> str:
+        """Xếp tin vào hàng gửi, trả message_id ngay (không chờ ACK)."""
+        me = self.client.require_connected()
+        if to is not None:
+            if not _is_id(to):
+                raise AppError("INVALID_INPUT", "'to' phải là user_id hoặc null")
+            if to == me["user_id"]:
+                raise AppError("INVALID_INPUT", "Không thể nhắn riêng cho chính mình")
+            if self.client.is_online(to) is False:
+                raise AppError("USER_OFFLINE", "Người nhận không trực tuyến")
+        if not isinstance(text, str) or not text.strip():
+            raise AppError("INVALID_INPUT", "Tin nhắn rỗng")
         try:
-            self.client.send_packet(packet)
-        except OSError as e:
-            self._update(msg.msg_id, MessageStatus.FAILED, reason=str(e))
-            return msg
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise AppError("INVALID_INPUT", "Tin nhắn chứa ký tự không hợp lệ") from None
+        if size > MAX_TEXT_BYTES:
+            raise AppError("PAYLOAD_TOO_LARGE", f"Tin nhắn vượt quá {MAX_TEXT_BYTES} byte UTF-8")
 
-        # Đặt timer trước khi chuyển SENT để MSG_ACK đến rất nhanh vẫn huỷ được timer.
-        self._start_timer(msg.msg_id)
-        self.store.set_status(msg.msg_id, MessageStatus.SENT)
-        return msg
-
-    # ---- nhận (gọi từ luồng nhận của ChatClient) --------------------------
-
-    def _on_msg(self, packet: dict) -> None:
+        message_id = str(uuid.uuid4())
+        payload = encode_json({"message_id": message_id, "to": to, "text": text})
+        with self._lock:
+            self._outgoing[message_id] = {}
+            while len(self._outgoing) > TRACK_LIMIT:
+                self._outgoing.popitem(last=False)
         try:
-            msg = Message(sender=str(packet["sender"]), to=packet.get("to") or None,
-                          text=str(packet["text"]),
-                          msg_id=str(packet.get("msg_id") or uuid.uuid4().hex),
-                          ts=float(packet.get("ts") or time.time()),
-                          status=MessageStatus.ACKED, direction="in")
-        except (KeyError, TypeError, ValueError):
-            self._on_event("error", {"code": "BAD_PACKET", "message": "Gói MSG không hợp lệ"})
+            self.client.send_reliable(CHAT_STREAM, PacketType.CHAT, payload,
+                                      on_result=lambda error: self._on_hop_result(message_id, error))
+        except AppError:
+            with self._lock:
+                self._outgoing.pop(message_id, None)
+            raise
+        return message_id
+
+    def _on_hop_result(self, message_id: str, error_code: str | None) -> None:
+        # ACK chặng client→server không có nghĩa accepted; accepted đến qua CHAT_STATUS.
+        if error_code is not None:
+            self._set_status(message_id, None, "failed", error_code)
+
+    # ---- nhận (luồng worker của ChatClient) --------------------------------------
+
+    def handle_message(self, peer_id: str, payload: dict) -> None:
+        """Gói CHAT từ server: {message_id, from, to, text, sent_at}."""
+        message_id, sender, to = payload.get("message_id"), payload.get("from"), payload.get("to")
+        text, sent_at = payload.get("text"), payload.get("sent_at")
+        if (not _is_id(message_id) or not _is_id(sender) or not (to is None or _is_id(to))
+                or not isinstance(text, str) or not isinstance(sent_at, str)):
+            log.warning("Bỏ CHAT thiếu hoặc sai trường")
             return
-        if self.store.get(msg.msg_id) is not None:
-            return  # trùng (server gửi lại) → bỏ qua
-        self.store.add(msg, self.client.username)
-        self._on_event("message", msg.to_dict())
+        key = (sender, message_id)
+        with self._lock:
+            if key in self._seen:
+                return                           # trùng: dedupe theo người gửi trong phiên
+            self._seen.add(key)
+            self._seen_order.append(key)
+            if len(self._seen_order) > TRACK_LIMIT:
+                self._seen.discard(self._seen_order.popleft())
+        self.client.emit("message_received", {"message_id": message_id, "from": sender,
+                                              "to": to, "text": text, "sent_at": sent_at})
 
-    def _on_msg_ack(self, packet: dict) -> None:
-        self._update(packet.get("msg_id"), MessageStatus.ACKED)
-
-    def _on_msg_fail(self, packet: dict) -> None:
-        self._update(packet.get("msg_id"), MessageStatus.FAILED, reason=packet.get("reason"))
-
-    # ---- nội bộ ----------------------------------------------------------
-
-    def _update(self, msg_id, status: MessageStatus, reason=None) -> None:
-        if not msg_id:
+    def handle_status(self, payload: dict) -> None:
+        """Gói CHAT_STATUS: {message_id, recipient_id, status, error_code}."""
+        message_id, recipient = payload.get("message_id"), payload.get("recipient_id")
+        status, error_code = payload.get("status"), payload.get("error_code")
+        if (not _is_id(message_id) or not (recipient is None or _is_id(recipient))
+                or status not in SERVER_STATUSES
+                or not (error_code is None or isinstance(error_code, str))):
+            log.warning("Bỏ CHAT_STATUS thiếu hoặc sai trường")
             return
-        self._cancel_timer(msg_id)
-        if self.store.set_status(msg_id, status) is not None:
-            data = {"msg_id": msg_id, "status": status.value}
-            if reason:
-                data["reason"] = reason
-            self._on_event("message_status", data)
+        self._set_status(message_id, recipient, status, error_code)
 
-    def _start_timer(self, msg_id: str) -> None:
-        t = threading.Timer(self._ack_timeout, self._update,
-                            args=(msg_id, MessageStatus.FAILED, "Hết thời gian chờ xác nhận"))
-        t.daemon = True
-        with self._timers_lock:
-            self._timers[msg_id] = t
-        t.start()
-
-    def _cancel_timer(self, msg_id: str) -> None:
-        with self._timers_lock:
-            t = self._timers.pop(msg_id, None)
-        if t:
-            t.cancel()
+    def handle_error(self, error: dict) -> None:
+        """ERROR có reference_id là tin của mình → tin đó failed."""
+        reference_id = error.get("reference_id")
+        if reference_id:
+            self._set_status(reference_id, None, "failed", error.get("code"))
 
     def reset(self) -> None:
-        """Gọi khi đăng xuất: huỷ timer và xoá lịch sử để người dùng sau không thấy."""
-        self.shutdown()
-        self.store.clear()
+        """Gọi khi kết thúc phiên."""
+        with self._lock:
+            self._outgoing.clear()
+            self._seen.clear()
+            self._seen_order.clear()
 
-    def shutdown(self) -> None:
-        with self._timers_lock:
-            timers, self._timers = list(self._timers.values()), {}
-        for t in timers:
-            t.cancel()
+    # ---- nội bộ -------------------------------------------------------------------
+
+    def _set_status(self, message_id: str, recipient: str | None, status: str,
+                    error_code: str | None) -> None:
+        with self._lock:
+            recipients = self._outgoing.get(message_id)
+            if recipients is None:
+                return                           # không phải tin của mình / đã quên
+            old = recipients.get(recipient, "queued")
+            # Không lùi trạng thái: delivered/failed là cuối, accepted không lặp lại.
+            if old in FINAL_STATUSES or old == status:
+                return
+            recipients[recipient] = status
+        self.client.emit("message_status", {"message_id": message_id, "recipient_id": recipient,
+                                            "status": status, "error_code": error_code})
