@@ -26,7 +26,7 @@ python -m unittest test_protocol_transport.TransportTests.test_lost_ack -v
 python tools/make_accounts.py --force
 
 # Sinh chứng chỉ TLS (lần đầu, trên máy chạy server; tự dò IP LAN, thêm --ip nếu cần)
-# Chỉ gửi certs/ca.crt cho máy client; certs/ không commit lên repo.
+# Chỉ gửi certs/ca.crt cho máy client; KHÔNG commit thư mục certs/ (có khóa riêng).
 python tools/gen_cert.py
 python tools/gen_cert.py --ip 192.168.1.10
 
