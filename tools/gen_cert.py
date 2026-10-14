@@ -21,6 +21,7 @@ import datetime
 import ipaddress
 import os
 import socket
+import sys
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -140,5 +141,15 @@ def main(argv=None):
     print("Phát ca.crt cho client; giữ ca.key và server.key trên máy server.")
 
 
+def _utf8_console():
+    """Windows: console/pipe mặc định cp1252, in tiếng Việt sẽ lỗi -> ép UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 if __name__ == "__main__":
+    _utf8_console()
     main()

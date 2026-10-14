@@ -68,7 +68,7 @@ def _b64(data: bytes) -> str:
 class CollabServer:
     """Server đăng nhập TCP/TLS, mỗi kết nối một thread.
 
-    ``session_backend`` là đối tượng (thường là module ``sessions``) cung cấp:
+    ``session_backend`` là đối tượng (thường là ``sessions.SessionManager``) cung cấp:
 
     * ``authenticate(username, password) -> Session``; raise ``AppError``
       với ``INVALID_CREDENTIALS``/``ALREADY_LOGGED_IN`` khi thất bại.
@@ -315,20 +315,22 @@ def parse_args(argv=None):
                    help="chứng chỉ server (mặc định %(default)s)")
     p.add_argument("--key", default="certs/server.key",
                    help="khóa riêng server (mặc định %(default)s)")
+    p.add_argument("--unbound-timeout", type=float, default=15.0,
+                   help="giây trước khi xóa phiên chưa bind UDP (mặc định %(default)s)")
+    p.add_argument("--accounts", default=None,
+                   help="file tài khoản demo (mặc định accounts.json cạnh sessions.py)")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.unbound_timeout <= 0 or args.login_timeout <= 0:
+        p.error("--unbound-timeout và --login-timeout phải > 0")
+    return args
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
     logging.basicConfig(level=args.log_level,
                         format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
-
-    import sessions
-    if not hasattr(sessions, "authenticate"):
-        log.error("sessions.py chưa có authenticate(); chưa chạy được server thật")
-        return 1
 
     ssl_context = None
     if args.no_tls:
@@ -342,7 +344,19 @@ def main(argv=None) -> int:
                       args.cert, args.key, exc)
             return 1
 
-    server = CollabServer(sessions, host=args.host, tcp_port=args.tcp_port,
+    import sessions
+    accounts_path = args.accounts or sessions.ACCOUNTS_FILE
+    try:
+        # Nạp tài khoản và chạy thread dọn phiên chưa bind.
+        manager = sessions.init(accounts_path, unbound_timeout=args.unbound_timeout)
+    except (OSError, ValueError) as exc:
+        log.error("Không nạp được tài khoản từ %s: %s. "
+                  "Chạy 'python tools/make_accounts.py' để sinh file", accounts_path, exc)
+        return 1
+    log.info("Đã nạp %d tài khoản từ %s; phiên chưa bind hết hạn sau %.1f giây",
+             len(manager.accounts), accounts_path, manager.unbound_timeout)
+
+    server = CollabServer(manager, host=args.host, tcp_port=args.tcp_port,
                           udp_port=args.udp_port, ssl_context=ssl_context,
                           login_timeout=args.login_timeout)
     try:
@@ -350,8 +364,20 @@ def main(argv=None) -> int:
     except OSError as exc:
         log.error("Không mở được cổng %s:%d: %s", args.host, args.tcp_port, exc)
         return 1
+    finally:
+        manager.stop()
     return 0
 
 
+def _utf8_console():
+    """Windows: console/pipe mặc định cp1252, in tiếng Việt sẽ lỗi -> ép UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 if __name__ == "__main__":
+    _utf8_console()
     sys.exit(main())

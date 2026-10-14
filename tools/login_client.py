@@ -58,5 +58,15 @@ def main(argv=None):
     return 0 if reply.get("type") == "LOGIN_OK" else 2
 
 
+def _utf8_console():
+    """Windows: console/pipe mặc định cp1252, in tiếng Việt sẽ lỗi -> ép UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 if __name__ == "__main__":
+    _utf8_console()
     sys.exit(main())

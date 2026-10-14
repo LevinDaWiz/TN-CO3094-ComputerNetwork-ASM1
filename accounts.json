@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "accounts": [
+    {
+      "user_id": "u01",
+      "username": "user01",
+      "password_hash": "pbkdf2_sha256$600000$GAv/F7yzpT8PgSEWLsLqiA==$CKVe9H0ICOCclItNj4FJcQdQI/Cl1zvcgGh7aMe+jgw="
+    },
+    {
+      "user_id": "u02",
+      "username": "user02",
+      "password_hash": "pbkdf2_sha256$600000$RAvKBDvrfI5zqbzh62dyrg==$ayGyz0hyAAiV6YYicm/rD0HPLYii7XbRWHAZRduKXQ4="
+    },
+    {
+      "user_id": "u03",
+      "username": "user03",
+      "password_hash": "pbkdf2_sha256$600000$BFGTpW6JMHEpuZ7V6aVPwQ==$LA5HMumzVdMkT+wmbW1UwbeY5ZYc4kEXYOEljOlVFIU="
+    },
+    {
+      "user_id": "u04",
+      "username": "user04",
+      "password_hash": "pbkdf2_sha256$600000$Ycn6jCazxypu3os+VKid2w==$C4qGcMUuEXuAdSrKqUdyerRsTUuRqLSZg0bkPbrqLA0="
+    },
+    {
+      "user_id": "u05",
+      "username": "user05",
+      "password_hash": "pbkdf2_sha256$600000$y2l905YCXRi8Y7dav5+YCQ==$ZW1zumd4e7j5QQ3vfPQxb/Co7Wwab6RxE7xU+MCHXQc="
+    },
+    {
+      "user_id": "u06",
+      "username": "user06",
+      "password_hash": "pbkdf2_sha256$600000$FI2mEF+Fd5bMYHQrY24FRw==$7OcDtidAugzAJK+AE/iJSl+XZo2429BsEVE8RkKxUlQ="
+    },
+    {
+      "user_id": "u07",
+      "username": "user07",
+      "password_hash": "pbkdf2_sha256$600000$zEWaaYYbtVoRc7O226EHWQ==$qlOg2l+X/AQ25WmDPC9tJ/SsCXv2wz1w1Yw6UBJx3NY="
+    },
+    {
+      "user_id": "u08",
+      "username": "user08",
+      "password_hash": "pbkdf2_sha256$600000$XV/0AgniTsYyqSakPmV8Jw==$oN75szNlT+mZjsh7t8Kzg1GfZrBYbqO51EGwb+0QMu0="
+    },
+    {
+      "user_id": "u09",
+      "username": "user09",
+      "password_hash": "pbkdf2_sha256$600000$qBACLe1bmZgxO+vqPbyg9A==$wb1xH+BJGiOUbLAhT+bURCR3OI6PFnquMpLfPsF6/dc="
+    },
+    {
+      "user_id": "u10",
+      "username": "user10",
+      "password_hash": "pbkdf2_sha256$600000$+m3n1VWHChpa2BghJuprVw==$SPrAEfaTQuF3+/FF5uqoVxszIRO+9A/LA66y/hZAzl4="
+    },
+    {
+      "user_id": "u11",
+      "username": "user11",
+      "password_hash": "pbkdf2_sha256$600000$gLV1fTu8ZrKC6CiQ9uAc4g==$ZRjS1m9tUHqq+FTTkNuQAjrjKkdixoEpDb7v3azPtts="
+    },
+    {
+      "user_id": "u12",
+      "username": "user12",
+      "password_hash": "pbkdf2_sha256$600000$KrQR6mP8DdYaj5d/4kXIdg==$K1JCqQShmzX63CihO+hGf8/fdEnM79TA0JNU5CWw88I="
+    },
+    {
+      "user_id": "u13",
+      "username": "user13",
+      "password_hash": "pbkdf2_sha256$600000$0XGj0aukrGq7L6Vpl3mJWQ==$ecdP/FBaeatuIfVQYYr+l1099HFI45CKdou8q1fX/XM="
+    },
+    {
+      "user_id": "u14",
+      "username": "user14",
+      "password_hash": "pbkdf2_sha256$600000$XpEUNofok3Eh7fQxdz4ZTA==$Bm0UncFWjDF1Usbkqvdt3PZt8xPhw08lYYkXd4hUQ2s="
+    },
+    {
+      "user_id": "u15",
+      "username": "user15",
+      "password_hash": "pbkdf2_sha256$600000$sqpNq0LBPOXpBjHjSPnQ3A==$qXJu2+x26ZmTQBS4uwrB/a14q823iPv4Yy2oMRSLBMs="
+    },
+    {
+      "user_id": "u16",
+      "username": "user16",
+      "password_hash": "pbkdf2_sha256$600000$W2LdYhru24ttRcfTBReiXw==$zAR+KoKWtFrZ1L/SBDe7KZ6OEWdMYSsRmeflZFNpWpg="
+    },
+    {
+      "user_id": "u17",
+      "username": "user17",
+      "password_hash": "pbkdf2_sha256$600000$55brSuZt1ToFcPCniSJC4A==$/vp3xTM75BloeRSXCCoBh+KWJKqR7r8XLP0e1mPT2IA="
+    },
+    {
+      "user_id": "u18",
+      "username": "user18",
+      "password_hash": "pbkdf2_sha256$600000$PjmRCHXZYb6X6cOAtAky8w==$JrfKubckK8B7MbFh9b8Ysm/f+eKP98r4/MT1Azo71dU="
+    },
+    {
+      "user_id": "u19",
+      "username": "user19",
+      "password_hash": "pbkdf2_sha256$600000$gk+fOnzYGF2VSw975pxxcw==$EXz1Uv9vXujcIf+tklRacV5G7FuBSzkylGVi2NgGH10="
+    },
+    {
+      "user_id": "u20",
+      "username": "user20",
+      "password_hash": "pbkdf2_sha256$600000$c4h4CRbEo46jpOnEoR0YwA==$KMzS1pyI6FXVV9dws+kgtegZJZ/IQK6C/3ieggYYP+A="
+    }
+  ]
+}
