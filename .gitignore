@@ -1,0 +1,5 @@
+# Khóa riêng TLS do tools/gen_cert.py sinh, không được commit
+certs/
+
+# Cache Python tự sinh khi chạy code
+__pycache__/
