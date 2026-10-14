@@ -51,3 +51,4 @@ python -m unittest discover -s tests -v
 python -m unittest tests.test_server_login -v
 python -m unittest tests.test_accounts -v
 python -m unittest tests.test_sessions -v
+python -m unittest tests.test_routing -v

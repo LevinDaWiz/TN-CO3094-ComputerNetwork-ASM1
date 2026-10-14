@@ -316,6 +316,9 @@ class SessionManager:
         self._by_id = {}            # session_id -> Session
         self._by_user = {}          # user_id -> session_id
         self._on_removed = None
+        # Tăng mỗi khi danh sách online đổi (phiên bind lần đầu hoặc phiên đã bind bị
+        # xóa). Dùng làm ``revision`` của USER_LIST (1b mục 8): client bỏ revision cũ.
+        self._online_revision = 0
         self._stop = threading.Event()
         self._thread = None
 
@@ -380,6 +383,8 @@ class SessionManager:
             if session.bound and session.udp_addr != address:
                 raise AppError(INVALID_SESSION, "Không được đổi địa chỉ UDP trong phiên")
             first_bind = not session.bound
+            if first_bind:
+                self._online_revision += 1
             session.udp_addr = address
             session.bound = True
             session.last_seen = self._clock()
@@ -390,8 +395,26 @@ class SessionManager:
     def list_online_users(self) -> list:
         """Danh sách ``[{user_id, username}]`` của các phiên đã bind, sắp theo user_id."""
         with self._lock:
-            users = [{"user_id": s.user_id, "username": s.username}
-                     for s in self._by_id.values() if s.bound]
+            return self._online_users_locked()
+
+    def online_snapshot(self):
+        """``(revision, users)`` lấy cùng một lúc, dùng để dựng USER_LIST.
+
+        ``revision`` chỉ tăng khi danh sách online thực sự đổi, nên hai snapshot
+        cùng revision chắc chắn cùng danh sách.
+        """
+        with self._lock:
+            return self._online_revision, self._online_users_locked()
+
+    def list_bound_sessions(self) -> list:
+        """Bản sao các phiên đã bind (người nhận được chat/USER_LIST), sắp theo user_id."""
+        with self._lock:
+            sessions = [dataclasses.replace(s) for s in self._by_id.values() if s.bound]
+        return sorted(sessions, key=lambda s: s.user_id)
+
+    def _online_users_locked(self) -> list:
+        users = [{"user_id": s.user_id, "username": s.username}
+                 for s in self._by_id.values() if s.bound]
         return sorted(users, key=lambda u: u["user_id"])
 
     def remove_session(self, session_id: int) -> None:
@@ -477,6 +500,8 @@ class SessionManager:
         session = self._by_id.pop(session_id, None)
         if session is not None and self._by_user.get(session.user_id) == session_id:
             del self._by_user[session.user_id]
+        if session is not None and session.bound:
+            self._online_revision += 1   # người đang online rời đi
         return session
 
 
