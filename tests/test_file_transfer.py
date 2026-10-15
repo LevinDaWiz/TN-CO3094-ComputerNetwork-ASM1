@@ -2,8 +2,8 @@
 
 Ba ``ReliableUDP`` (client A, server S, client B) với AES-GCM thật; datagram đi
 qua hàng đợi trong bộ nhớ có thể mất / trùng / đảo thứ tự, đồng hồ giả để
-timeout chạy nhanh. Server là ``FakeFileServer`` (giả lập tối giản, không phải
-server.py) và chuyển tiếp CHAT.
+timeout chạy nhanh. Server là ``FakeFileServer`` và client là ``FakeClient``
+(giả lập tối giản, không phải server.py / client.py).
 
 Chạy từ thư mục gốc repo::
 
@@ -24,8 +24,9 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import file_transfer as ft  # noqa: E402
+from fake_client import FakeClient  # noqa: E402
 from fake_file_server import FakeFileServer  # noqa: E402
-from file_transfer import (AppError, FileTransferManager,  # noqa: E402
+from file_transfer import (AppError,  # noqa: E402
                            chunk_length, safe_filename, total_chunks, unique_path,
                            validate_offer)
 from protocol import CryptoContext, PacketType, decode_json, encode_json  # noqa: E402
@@ -61,14 +62,14 @@ class Net:
             self.t["S"].register_peer(name, session_id, self.addr[name],
                                       CryptoContext(s2c, ps), CryptoContext(c2s, pc))
         self.events = {"A": [], "B": []}
-        self.chats = {"A": [], "B": []}
-        self.files = {}
+        self.clients, self.files, self.chats = {}, {}, {}
         for name in ("A", "B"):
-            self.files[name] = FileTransferManager(
+            client = FakeClient(
                 self.t[name], download_dir=os.path.join(tmp, "dl_" + name),
-                emit=lambda kind, data, n=name: self.events[n].append((kind, data)),
-                clock=clock, accept_timeout=accept_timeout, idle_timeout=idle_timeout)
-            self._wire_client(name)
+                on_event=lambda kind, data, n=name: self.events[n].append((kind, data)),
+                clock=clock, accept_timeout=accept_timeout, idle_timeout=idle_timeout,
+                autostart=False)
+            self.clients[name], self.files[name], self.chats[name] = client, client.files, client.chats
         self.server = FakeFileServer(self.t["S"], USERS)
         s = self.t["S"]
         s.on_payload(self._server_payload)
@@ -81,17 +82,6 @@ class Net:
             dst = next(k for k, v in self.addr.items() if v == address)
             self.wire.append((raw, name, dst))
         return send
-
-    def _wire_client(self, name):
-        files, t = self.files[name], self.t[name]
-
-        def on_payload(peer, stream, kind, payload):
-            if not files.handle_packet(peer, stream, kind, payload) and kind == PacketType.CHAT:
-                self.chats[name].append(decode_json(payload))
-        t.on_payload(on_payload)
-        t.on_delivery(files.handle_delivery)
-        t.on_failure(files.handle_failure)
-        t.on_peer_closed(files.handle_peer_closed)
 
     def _server_payload(self, peer, stream, kind, payload):
         if self.server.handle_packet(peer, stream, kind, payload):

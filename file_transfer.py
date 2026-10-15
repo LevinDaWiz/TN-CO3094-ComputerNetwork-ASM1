@@ -15,10 +15,11 @@ Vòng đời một lần truyền (1b_protocol_spec.md §7)::
     A --FILE_END----> S --FILE_END-----------> B   kiểm tra số chunk, size, hash
     A <-FILE_RESULT-- S <-FILE_RESULT--------- B   đổi tên .part -> tên thật
 
-Các hàm ``handle_*`` nhận callback của transport (payload, delivery, failure,
-peer_closed) và trả True nếu gói/delivery thuộc module này. Callback chỉ làm
-việc nhỏ (ghi 1 KiB, cập nhật hash) rồi trả về; event được phát qua ``emit``
-sau khi nhả lock. ``start()`` chạy timer cho timeout và bơm chunk lại.
+Gửi gói qua ``ChatClient`` (client.py) giống messaging.py: ``send_reliable``,
+``allocate_stream``, ``emit``. Client chuyển vào ``handle_packet`` (FILE_* và
+ERROR trên luồng >=3) và gọi ``handle_disconnect`` khi mất phiên. Callback chỉ
+làm việc nhỏ (ghi 1 KiB, cập nhật hash) rồi trả về; timer tự chạy khi có
+transfer đầu tiên để xử lý timeout và bơm chunk lại.
 """
 from __future__ import annotations
 
@@ -230,6 +231,7 @@ class Transfer:
     deadline: float = 0.0
     # Bên gửi
     source_path: str | None = None
+    delete_source: bool = False   # tệp tạm upload: xóa khi xong
     next_chunk: int = 0         # gửi: chunk sẽ đọc tiếp; nhận: chunk đang chờ
     acked_chunks: int = 0
     inflight: int = 0
@@ -255,47 +257,57 @@ class Transfer:
 
 
 class FileTransferManager:
-    """Gửi/nhận tệp ở client qua peer ``server_peer`` của transport.
+    """Gửi/nhận tệp ở client, gửi gói qua đối tượng ``client`` (ChatClient).
 
-    Một RLock bảo vệ mọi trạng thái. Được phép gọi ``transport.send`` khi đang
-    giữ lock vì transport không bao giờ gọi ngược vào đây trong lock của nó.
+    ``client`` cần có (giống cách messaging.py dùng):
+
+    * ``send_reliable(stream_id, packet_type, payload, on_result) -> delivery_id``;
+      ``on_result(error_code | None)`` được gọi khi gói được ACK hoặc thất bại.
+    * ``allocate_stream() -> int``: mở luồng file mới (ID lẻ từ 3).
+    * ``emit(type, data)``: đưa event vào hàng đợi cho giao diện.
+    * ``close_stream(stream_id, reason)`` (không bắt buộc): đóng luồng đã xong.
+
+    Phía client gọi vào: ``handle_packet`` cho gói FILE_* và ERROR trên luồng >=3,
+    ``handle_disconnect`` khi mất phiên.
+
+    Một RLock bảo vệ mọi trạng thái. Được phép gọi ``send_reliable`` khi đang giữ
+    lock vì client không bao giờ gọi ngược vào đây khi đang giữ lock của nó.
     """
 
-    def __init__(self, transport, *, server_peer: str = "server",
-                 download_dir: str = "downloads",
-                 emit: Callable[[str, dict], None] | None = None,
+    def __init__(self, client, *, download_dir: str = "downloads",
                  clock: Callable[[], float] = time.monotonic,
                  max_inflight: int = MAX_INFLIGHT,
                  accept_timeout: float = ACCEPT_TIMEOUT,
-                 idle_timeout: float = IDLE_TIMEOUT):
+                 idle_timeout: float = IDLE_TIMEOUT,
+                 autostart: bool = True):
         if max_inflight < 1:
             raise ValueError("max_inflight phải >= 1")
-        self.transport = transport
-        self.server_peer = server_peer
+        self.client = client
         self.download_dir = os.path.abspath(download_dir)
         self.clock = clock
         self.max_inflight = max_inflight
         self.accept_timeout = accept_timeout
         self.idle_timeout = idle_timeout
-        self._emit_cb = emit
+        self.autostart = autostart      # tự chạy timer khi có transfer đầu tiên
         self._lock = threading.RLock()
         self._flush_lock = threading.RLock()
         self._outbox: list[tuple[str, dict]] = []
         self._transfers: dict[str, Transfer] = {}
         self._by_stream: dict[int, str] = {}
-        self._deliveries: dict[str, tuple[str, str, int]] = {}   # delivery_id -> (tid, kind, nbytes)
         self._stop = threading.Event()
         self._timer: threading.Thread | None = None
 
     # ----- API module (1a_api.md §5) -----
 
     def offer_file(self, to: str, path: str, transfer_id: str | None = None, *,
-                   filename: str | None = None, sha256: str | None = None) -> str:
+                   filename: str | None = None, sha256: str | None = None,
+                   delete_source: bool = False) -> str:
         """Gửi FILE_OFFER cho tệp ``path`` (đường dẫn do bên gọi quản lý).
 
         Tham số tùy chọn ngoài hợp đồng: ``transfer_id`` (None thì tự sinh),
         ``filename`` hiển thị khi tên tệp trên đĩa khác tên gốc, ``sha256`` nếu
-        bên gọi đã băm sẵn. Tệp ``path`` phải giữ nguyên tới khi transfer kết thúc.
+        bên gọi đã băm sẵn, ``delete_source`` xóa ``path`` khi transfer kết thúc
+        (dùng cho tệp tạm upload). Không xóa thì ``path`` phải giữ nguyên tới lúc đó.
         """
         if not _is_user_id(to):
             raise AppError(INVALID_PACKET, "Người nhận không hợp lệ")
@@ -322,10 +334,10 @@ class FileTransferManager:
                 t = Transfer(tid, OUTGOING, to,
                              safe_filename(filename or os.path.basename(path)), size, OFFERED,
                              sha256=sha256.lower(), total_chunks=total_chunks(size),
-                             source_path=path)
+                             source_path=path, delete_source=delete_source)
                 self._transfers[tid] = t
                 try:
-                    t.stream_id = self.transport.allocate_stream(self.server_peer)
+                    t.stream_id = self.client.allocate_stream()
                     self._by_stream[t.stream_id] = t.transfer_id
                     offer = encode_json({"transfer_id": t.transfer_id, "to": t.peer_id,
                                          "filename": t.filename, "size": t.size,
@@ -337,6 +349,7 @@ class FileTransferManager:
                     raise
                 t.deadline = self.clock() + self.accept_timeout
                 self._set_status(t, OFFERED)
+                self._ensure_timer()
                 return t.transfer_id
         finally:
             self._flush()
@@ -394,10 +407,11 @@ class FileTransferManager:
                 raise AppError(INVALID_STATE, "Tệp chưa nhận xong")
             return t.final_path
 
-    # ----- Callback từ transport -----
+    # ----- Client gọi vào -----
 
     def handle_packet(self, peer_id: str, stream_id: int, packet_type: int, payload: bytes) -> bool:
-        if peer_id != self.server_peer or not is_file_packet(stream_id, packet_type):
+        """Gói FILE_* hoặc ERROR trên luồng >=3. Trả False nếu không phải gói tệp."""
+        if not is_file_packet(stream_id, packet_type):
             return False
         try:
             with self._lock:
@@ -406,47 +420,16 @@ class FileTransferManager:
             self._flush()
         return True
 
-    def handle_delivery(self, delivery_id: str) -> bool:
-        try:
-            with self._lock:
-                return self._on_delivery(delivery_id)
-        finally:
-            self._flush()
-
-    def handle_failure(self, delivery_id: str, error_code: str | None = None) -> bool:
-        try:
-            with self._lock:
-                info = self._deliveries.pop(delivery_id, None)
-                if info is None:
-                    return False
-                if info[1] == "final-orphan":
-                    self._close_stream_id(info[2], error_code or DELIVERY_TIMEOUT)
-                    return True
-                t = self._transfers.get(info[0])
-                if t is not None:
-                    if info[1] == "final" or t.status in TERMINAL:
-                        self._close_stream(t, error_code or DELIVERY_TIMEOUT)
-                    else:
-                        # Transport đã đóng luồng hỏng; không còn đường báo bên kia.
-                        self._fail(t, error_code or DELIVERY_TIMEOUT)
-                return True
-        finally:
-            self._flush()
-
-    def handle_peer_closed(self, peer_id: str, reason: str | None = None) -> bool:
+    def handle_disconnect(self, reason: str | None = None) -> None:
         """Mất phiên với server: mọi tệp dang dở thất bại, dọn tệp tạm."""
-        if peer_id != self.server_peer:
-            return False
         try:
             with self._lock:
                 for t in list(self._transfers.values()):
                     self._fail(t, reason or "PEER_CLOSED")
                 # Phiên mới cấp lại stream từ 3: bỏ ánh xạ cũ.
                 self._by_stream.clear()
-                self._deliveries.clear()
         finally:
             self._flush()
-        return True
 
     # ----- Timer -----
 
@@ -471,29 +454,31 @@ class FileTransferManager:
             self._flush()
 
     def start(self, interval: float = 0.25) -> None:
-        if self._timer is not None:
-            return
-        self._stop.clear()
+        with self._lock:
+            if self._timer is not None:
+                return
+            self._stop.clear()
 
-        def loop():
-            while not self._stop.wait(interval):
-                try:
-                    self.tick()
-                except Exception:
-                    log.exception("File transfer tick failed")
+            def loop():
+                while not self._stop.wait(interval):
+                    try:
+                        self.tick()
+                    except Exception:
+                        log.exception("File transfer tick failed")
 
-        self._timer = threading.Thread(target=loop, daemon=True, name="cc-files")
-        self._timer.start()
+            self._timer = threading.Thread(target=loop, daemon=True, name="cc-files")
+            self._timer.start()
 
     def stop(self) -> None:
         self._stop.set()
-        if self._timer is not None and self._timer is not threading.current_thread():
-            self._timer.join(timeout=1)
-        self._timer = None
+        timer, self._timer = self._timer, None
+        if timer is not None and timer is not threading.current_thread():
+            timer.join(timeout=1)
 
     def close(self) -> None:
-        """Client thoát/đăng xuất: dừng timer, hủy tệp dang dở, xóa tệp tạm."""
+        """Client thoát: dừng timer, hủy tệp dang dở, xóa tệp tạm."""
         self.stop()
+        self.autostart = False
         try:
             with self._lock:
                 for t in list(self._transfers.values()):
@@ -570,15 +555,16 @@ class FileTransferManager:
         self._event("file_offer", {"transfer_id": tid, "from": t.peer_id,
                                    "filename": t.filename, "size": t.size})
         self._event("file_status", self._status_data(t))
+        self._ensure_timer()
 
     def _refuse_stream(self, stream_id: int, tid, code: str) -> None:
         """Offer hỏng: trả FILE_REJECT nếu có transfer_id hợp lệ, rồi đóng luồng."""
         if _is_uuid(tid):
             try:
-                did = self.transport.send(self.server_peer, stream_id, PacketType.FILE_REJECT,
-                                          encode_json({"transfer_id": tid, "reason": code}))
-                # Chỉ để đóng luồng sau khi gói tới; không gắn transfer.
-                self._deliveries[did] = ("", "final-orphan", stream_id)
+                self.client.send_reliable(
+                    stream_id, PacketType.FILE_REJECT,
+                    encode_json({"transfer_id": tid, "reason": code}),
+                    lambda error, sid=stream_id: self._on_send_result(None, sid, "final", 0, error))
                 return
             except AppError:
                 pass
@@ -707,39 +693,40 @@ class FileTransferManager:
         self._send_final(t, PacketType.FILE_RESULT, encode_json(
             {"transfer_id": t.transfer_id, "status": COMPLETED, "error_code": None}))
 
-    def _on_delivery(self, delivery_id: str) -> bool:
-        info = self._deliveries.pop(delivery_id, None)
-        if info is None:
-            return False
-        tid, kind, n = info
-        if kind == "final-orphan":
-            self._close_stream_id(n, "TRANSFER_DONE")
-            return True
-        t = self._transfers.get(tid)
-        if t is None:
-            return True
-        if kind == "final":
-            self._close_stream(t, "TRANSFER_DONE")
-            return True
-        if t.status in TERMINAL:
-            return True
-        if t.status != OFFERED:     # đang chờ chấp nhận: giữ hạn accept_timeout
-            t.deadline = self.clock() + self.idle_timeout
-        if kind == "chunk":
-            t.inflight -= 1
-            t.acked_chunks += 1
-            t.bytes_done += n
-            self._progress(t, force=t.bytes_done == t.size)
-            if t.status == TRANSFERRING:
-                self._pump(t)
-        return True
+    def _on_send_result(self, tid: str | None, stream_id: int, tag: str, nbytes: int,
+                        error: str | None) -> None:
+        """on_result của send_reliable: gói đã được ACK (error None) hoặc thất bại."""
+        try:
+            with self._lock:
+                t = self._transfers.get(tid) if tid else None
+                if tag == "final" or t is None or t.status in TERMINAL:
+                    # Gói cuối đã tới / tệp đã xong: chỉ còn việc đóng luồng.
+                    if tag == "final" or error is not None:
+                        self._close_stream_id(stream_id, error or "TRANSFER_DONE")
+                    return
+                if error is not None:
+                    # Hết lượt truyền lại hoặc mất phiên: không còn đường báo bên kia.
+                    self._fail(t, error)
+                    return
+                if t.status != OFFERED:     # đang chờ chấp nhận: giữ hạn accept_timeout
+                    t.deadline = self.clock() + self.idle_timeout
+                if tag == "chunk":
+                    t.inflight -= 1
+                    t.acked_chunks += 1
+                    t.bytes_done += nbytes
+                    self._progress(t, force=t.bytes_done == t.size)
+                    if t.status == TRANSFERRING:
+                        self._pump(t)
+        finally:
+            self._flush()
 
     # ----- Nội bộ -----
 
     def _send(self, t: Transfer, kind: PacketType, payload: bytes, tag: str, nbytes: int = 0) -> str:
-        did = self.transport.send(self.server_peer, t.stream_id, kind, payload)
-        self._deliveries[did] = (t.transfer_id, tag, nbytes)
-        return did
+        tid, sid = t.transfer_id, t.stream_id
+        return self.client.send_reliable(
+            sid, kind, payload,
+            lambda error: self._on_send_result(tid, sid, tag, nbytes, error))
 
     def _send_final(self, t: Transfer, kind: PacketType, payload: bytes) -> None:
         """Gói cuối của luồng: đóng luồng khi gói đã tới (hoặc gửi thất bại)."""
@@ -779,17 +766,32 @@ class FileTransferManager:
         if t.direction == INCOMING and not success and t.temp_path:
             _remove_quietly(t.temp_path)
             t.temp_path = None
+        if t.direction == OUTGOING and t.delete_source and t.source_path:
+            _remove_quietly(t.source_path)
+            t.source_path = None
 
     def _close_stream(self, t: Transfer, reason: str) -> None:
         if t.stream_id and self._by_stream.get(t.stream_id) == t.transfer_id:
             self._close_stream_id(t.stream_id, reason)
 
     def _close_stream_id(self, stream_id: int, reason: str) -> None:
+        if self._by_stream.get(stream_id) is not None:
+            tid = self._by_stream[stream_id]
+            t = self._transfers.get(tid)
+            if t is not None and t.status not in TERMINAL:
+                return      # luồng đã thuộc transfer khác đang chạy (phiên mới)
         self._by_stream.pop(stream_id, None)
+        closer = getattr(self.client, "close_stream", None)
+        if closer is None:
+            return
         try:
-            self.transport.close_stream(self.server_peer, stream_id, reason)
+            closer(stream_id, reason)
         except AppError:
-            pass        # peer đã đóng
+            pass        # phiên đã đóng
+
+    def _ensure_timer(self) -> None:
+        if self.autostart and self._timer is None:
+            self.start()
 
     def _set_status(self, t: Transfer, status: str) -> None:
         t.status = status
@@ -828,13 +830,15 @@ class FileTransferManager:
         with self._flush_lock:
             with self._lock:
                 events, self._outbox = self._outbox, []
-            if self._emit_cb is None:
-                return
             for kind, data in events:
                 try:
-                    self._emit_cb(kind, data)
+                    self.client.emit(kind, data)
                 except Exception:
                     log.exception("File event callback failed")
+
+
+# Tên http_bridge.py (Người 3) đang dùng: client.attach_file_service(FileTransfer(client, ...))
+FileTransfer = FileTransferManager
 
 
 def _remove_quietly(path: str) -> None:

@@ -2,8 +2,8 @@
 
 Không cần đăng nhập TLS: script tự đăng ký khóa phiên cho ba transport, chỉ
 để kiểm tra file_transfer.py + reliable_udp.py chạy đa luồng thật. Server ở
-đây là server giả lập tối giản (tests/fake_file_server.py), không phải
-server.py. Trong lúc
+đây là server/client giả lập tối giản (tests/fake_*.py), không phải
+server.py/client.py. Trong lúc
 truyền, A gửi một tin chat để chứng minh luồng tệp không chặn chat.
 
     python tools/file_transfer_demo.py                  # tệp ngẫu nhiên 5 MiB
@@ -22,9 +22,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
+from fake_client import FakeClient  # noqa: E402
 from fake_file_server import FakeFileServer  # noqa: E402
-from file_transfer import FileTransferManager, sha256_file  # noqa: E402
-from protocol import CryptoContext, PacketType, decode_json, encode_json  # noqa: E402
+from file_transfer import sha256_file  # noqa: E402
+from protocol import CryptoContext, PacketType, encode_json  # noqa: E402
 from reliable_udp import ReliableUDP  # noqa: E402
 
 
@@ -73,20 +74,11 @@ def run_demo(source: str, download_dir: str, *, timeout: float = 300.0, log=prin
                 finished.set()
 
     managers = {
-        "A": FileTransferManager(clients["A"], download_dir=os.path.join(download_dir, "A"), emit=on_event),
-        "B": FileTransferManager(clients["B"], download_dir=os.path.join(download_dir, "B"), emit=on_event),
+        name: FakeClient(transport, download_dir=os.path.join(download_dir, name),
+                         on_event=on_event,
+                         on_chat=lambda data: chat_at.append((time.monotonic(), data["text"]))).files
+        for name, transport in clients.items()
     }
-    for name, transport in clients.items():
-        files = managers[name]
-
-        def on_payload(peer, stream, kind, payload, files=files):
-            if not files.handle_packet(peer, stream, kind, payload) and kind == PacketType.CHAT:
-                chat_at.append((time.monotonic(), decode_json(payload)["text"]))
-        transport.on_payload(on_payload)
-        transport.on_delivery(files.handle_delivery)
-        transport.on_failure(files.handle_failure)
-        transport.on_peer_closed(files.handle_peer_closed)
-        files.start()
     for transport in (server, *clients.values()):
         transport.start()
 
