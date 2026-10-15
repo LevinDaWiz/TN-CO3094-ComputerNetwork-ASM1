@@ -52,3 +52,14 @@ python -m unittest tests.test_server_login -v
 python -m unittest tests.test_accounts -v
 python -m unittest tests.test_sessions -v
 python -m unittest tests.test_routing -v
+
+# ===== Truyền tệp (Người 4: file_transfer.py) =====
+
+# Test truyền tệp (server giả lập trong tests/, không phải server.py): mất/trùng/đảo gói + UDP thật
+python -m unittest tests.test_file_transfer -v
+
+# Demo A -> server -> B qua UDP localhost (in tiến độ, kiểm tra SHA-256, chat song song)
+python tools/file_transfer_demo.py
+python tools/file_transfer_demo.py --size-mib 100
+python tools/file_transfer_demo.py --file duong_dan_toi_tep.pdf
+
