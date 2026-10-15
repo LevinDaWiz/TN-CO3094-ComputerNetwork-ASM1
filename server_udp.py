@@ -42,9 +42,23 @@ class ServerUDP(ReliableUDP):
     Chỉ dùng thuộc tính công khai ``peers`` của lớp cha, không đụng lock/biến nội bộ.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, sock=None, **kwargs):
+        super().__init__(sock, **kwargs)
         self._on_unknown = None
+        # Đường gửi riêng cho send_raw (cùng nguồn với lớp cha: socket hoặc send_datagram).
+        send_datagram = kwargs.get("send_datagram")
+        self._raw_send = send_datagram or (lambda wire, address: sock.sendto(wire, address))
+
+    def send_raw(self, wire: bytes, address: tuple) -> None:
+        """Gửi một datagram đã mã hóa sẵn, không qua hàng đợi reliable.
+
+        Dùng khi peer đã đóng nhưng vẫn phải trả lời, ví dụ ACK lại LOGOUT bị
+        truyền lại trong 60 giây (1b mục 8). Lỗi gửi chỉ ghi log.
+        """
+        try:
+            self._raw_send(wire, address)
+        except OSError:
+            log.debug("Gửi UDP thô thất bại", exc_info=True)
 
     def on_unknown_datagram(self, callback) -> None:
         """Đăng ký ``callback(raw, address)`` cho gói của phiên chưa ``register_peer``.

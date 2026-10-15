@@ -19,6 +19,13 @@ python -m unittest test_protocol_transport.TransportTests.test_lost_ack -v
 
 # ===== Server và tài khoản (Người 2: server.py, sessions.py) =====
 
+# Tình trạng server (16/10):
+#   Đã chạy: đăng nhập TCP/TLS 9000; phiên + tài khoản demo; UDP 9001: UDP_BIND/UDP_BIND_OK,
+#            USER_LIST khi có người vào/ra, chat riêng/chung + CHAT_STATUS (accepted/delivered/failed),
+#            heartbeat (15 s mất kết nối thì xóa khỏi online), LOGOUT.
+#   Chưa:    chuyển tiếp tệp qua server (đang làm; gói tệp hiện bị bỏ qua).
+#   Client thật (client.py) chưa có -> xem luồng đầy đủ bằng test end-to-end ở cuối mục này.
+
 # Tài khoản demo (không có đăng ký): user01..user20 / mật khẩu pass01..pass20
 # user_id tương ứng u01..u20. Mật khẩu chỉ để demo.
 # accounts.json chỉ lưu hash PBKDF2-HMAC-SHA256 (600000 vòng, salt riêng từng tài khoản).
@@ -30,7 +37,8 @@ python tools/make_accounts.py --force
 python tools/gen_cert.py
 python tools/gen_cert.py --ip 192.168.1.10
 
-# Chạy server (TLS bật mặc định; TCP 9000, UDP 9001)
+# Chạy server (TLS bật mặc định; TCP 9000, UDP 9001; log in ra màn hình, Ctrl+C để dừng)
+# Windows: lần đầu chạy, Windows Firewall hỏi quyền -> bấm Allow, nếu không máy khác trong LAN không vào được.
 python server.py
 python server.py --host 0.0.0.0 --tcp-port 9000 --udp-port 9001 --login-timeout 10 --accounts accounts.json
 python server.py --help
@@ -52,6 +60,11 @@ python -m unittest tests.test_server_login -v
 python -m unittest tests.test_accounts -v
 python -m unittest tests.test_sessions -v
 python -m unittest tests.test_routing -v
+python -m unittest tests.test_server_udp -v
+python -m unittest tests.test_udp_service -v
+
+# Test end-to-end bằng socket thật: TCP login -> UDP_BIND -> USER_LIST -> chat riêng -> delivered
+python -m unittest tests.test_udp_service.EndToEndRealSocketTests -v
 
 # ===== Truyền tệp (Người 4: file_transfer.py) =====
 

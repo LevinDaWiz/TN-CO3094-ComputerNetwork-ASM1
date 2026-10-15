@@ -12,11 +12,13 @@ Theo ``1b_protocol_spec.md`` mục 2:
 * TLS bật mặc định vì LOGIN_OK chứa khóa AES của phiên; ``--no-tls`` chỉ dùng
   để debug (giảng viên chưa xác nhận TLS có bắt buộc hay không).
 
-Ngoài ra có phần logic dùng cho UDP (chưa gắn socket, chờ transport):
+Phần UDP cổng 9001 (transport là ``server_udp.ServerUDP``):
 
 * ``build_user_list_parts``: USER_LIST phân trang <= 1149 byte (1b mục 8).
 * ``ChatRouter``: kiểm tra CHAT, chọn người nhận chat riêng/chung, chống trùng
   message_id, tạo payload có ``from``/``sent_at`` (1b mục 6).
+* ``UdpService``: UDP_BIND/UDP_BIND_OK, USER_LIST khi online đổi, chat qua UDP
+  kèm CHAT_STATUS, heartbeat/timeout, LOGOUT. Chuyển tiếp tệp: bước sau.
 
 Không ghi mật khẩu, khóa phiên hay nonce prefix vào log.
 """
@@ -38,7 +40,10 @@ import uuid
 
 from framing import (MAX_FRAME_LEN, INVALID_PACKET, PAYLOAD_TOO_LARGE,  # noqa: F401
                      ConnectionClosed, recv_frame, send_frame)
-from protocol import MAX_PLAINTEXT, AppError, encode_json   # dùng chung của cả nhóm
+from protocol import (MAX_PLAINTEXT, AppError, CryptoContext, Flags, Header,  # của nhóm
+                      PacketType, decode_json, decode_packet, encode_ack, encode_json,
+                      encode_packet, peek_header)
+from server_udp import ServerUDP
 
 log = logging.getLogger("server")
 
@@ -500,6 +505,247 @@ class ChatRouter:
 
 
 # ---------------------------------------------------------------------------
+# Dịch vụ UDP 9001: UDP_BIND, USER_LIST, chat, heartbeat, LOGOUT
+# ---------------------------------------------------------------------------
+
+LOGOUT_TOMBSTONE_SECONDS = 60.0     # 1b mục 8: ACK lại LOGOUT trùng trong 60 giây
+STREAM_SESSION = 1                  # 1b mục 5: phiên/presence/error chung
+STREAM_CHAT = 2                     # CHAT và CHAT_STATUS
+
+# Lý do transport báo khi gói tới người nhận thất bại -> mã lỗi gửi người gửi.
+_FAILURE_TO_CHAT_ERROR = {"DELIVERY_TIMEOUT": "DELIVERY_TIMEOUT"}
+
+
+@dataclasses.dataclass
+class _LogoutTombstone:
+    """Trạng thái tối thiểu sau LOGOUT để ACK lại gói LOGOUT bị truyền lại."""
+    expire_at: float
+    address: tuple
+    rx: CryptoContext = dataclasses.field(repr=False)
+    tx: CryptoContext = dataclasses.field(repr=False)   # dùng tiếp counter cũ, không tạo mới
+    ack_seq: int = 1
+
+
+class UdpService:
+    """Logic UDP phía server, nối ``ServerUDP`` với registry phiên và ``ChatRouter``.
+
+    * UDP_BIND (gói đầu tiên của phiên, chưa có peer): xác thực bằng khóa c2s
+      của phiên, ``bind_udp`` với địa chỉ nguồn thực tế, ``register_peer``, rồi
+      đưa lại gói cho transport để được ACK và giao lên ``on_payload``.
+    * Sau UDP_BIND: trả UDP_BIND_OK, ``activate_peer`` (bật heartbeat 5 s, hết hạn
+      15 s) và gửi USER_LIST cho mọi người.
+    * CHAT (stream 2): ``ChatRouter`` chọn người nhận; gửi được vào hàng đợi thì báo
+      người gửi ``accepted``, người nhận ACK thì ``delivered``, lỗi thì ``failed``.
+    * LOGOUT (stream 1): xóa phiên; giữ khóa 60 giây để ACK lại LOGOUT trùng.
+    * Peer hết hạn (heartbeat) hoặc phiên bị xóa ở đâu đó: đóng peer, cập nhật USER_LIST.
+
+    Mọi callback chạy ngoài lock của transport. ``self._lock`` chỉ bảo vệ các bảng
+    nhỏ của lớp này; không gọi callback khi đang giữ nó.
+    """
+
+    def __init__(self, sessions, transport, *, router=None, clock=time.monotonic):
+        self.sessions = sessions
+        self.transport = transport
+        self.router = router if router is not None else ChatRouter(sessions)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._ready = set()          # session_id đã nhận UDP_BIND_OK
+        self._crypto = {}            # session_id -> (tx, rx) đang dùng cho peer
+        self._chat = {}              # delivery_id -> (sender_sid, message_id, recipient_id)
+        self._tombstones = {}        # session_id -> _LogoutTombstone
+        transport.on_unknown_datagram(self._on_unknown)
+        transport.on_payload(self._on_payload)
+        transport.on_delivery(self._on_delivery)
+        transport.on_failure(self._on_failure)
+        transport.on_peer_closed(self._on_peer_closed)
+        sessions.on_session_removed(self._on_session_removed)
+
+    # ----- gói của phiên chưa có peer -------------------------------------
+
+    def _on_unknown(self, raw: bytes, address: tuple) -> None:
+        try:
+            session_id = peek_header(raw).session_id
+        except AppError:
+            return
+        tomb = self._get_tombstone(session_id)
+        if tomb is not None:
+            self._ack_duplicate_logout(session_id, tomb, raw, address)
+            return
+        session = self.sessions.get_session(session_id)
+        if session is None or session.bound:
+            return                                    # không có phiên / đã bind: bỏ, không ACK
+        rx = CryptoContext(session.c2s_key, session.c2s_nonce_prefix)
+        try:
+            packet = decode_packet(raw, rx)           # sai khóa hoặc tag -> AppError
+        except AppError:
+            return
+        if (packet.header.packet_type != PacketType.UDP_BIND
+                or packet.header.stream_id != STREAM_SESSION):
+            return
+        try:
+            self.sessions.bind_udp(session_id, address)
+        except AppError:
+            return
+        # MỘT context gửi cho mỗi phiên; tạo lại sẽ dùng lại nonce từ 0.
+        tx = CryptoContext(session.s2c_key, session.s2c_nonce_prefix)
+        try:
+            self.transport.register_peer(str(session_id), session_id, address, tx, rx)
+        except AppError as exc:
+            log.warning("Không đăng ký được peer cho %s: %s", session.user_id, exc.code)
+            self.sessions.remove_session(session_id)
+            return
+        with self._lock:
+            self._crypto[session_id] = (tx, rx)
+        self.transport.receive_datagram(raw, address)   # lần này: ACK + giao lên on_payload
+
+    # ----- gói của peer đã đăng ký ------------------------------------------
+
+    def _on_payload(self, peer_id: str, stream_id: int, kind: int, payload: bytes) -> None:
+        session = self.sessions.get_session(int(peer_id))
+        if session is None:
+            return                                    # đã logout/hết hạn: bỏ hoạt động mới
+        if kind == PacketType.UDP_BIND and stream_id == STREAM_SESSION:
+            self._send(peer_id, STREAM_SESSION, PacketType.UDP_BIND_OK, encode_json({}))
+            self.transport.activate_peer(peer_id)
+            with self._lock:
+                self._ready.add(session.session_id)
+            self.broadcast_user_list()
+        elif kind == PacketType.LOGOUT and stream_id == STREAM_SESSION:
+            self._logout(session)
+        elif kind == PacketType.CHAT and stream_id == STREAM_CHAT:
+            self._handle_chat(session, payload)
+        else:
+            # Gói tệp (stream >= 3) sẽ được chuyển tiếp ở bước sau.
+            log.debug("Bỏ qua gói loại %s trên stream %s từ %s", kind, stream_id, session.user_id)
+
+    def _handle_chat(self, sender, payload: bytes) -> None:
+        sender_peer = str(sender.session_id)
+        try:
+            message = decode_json(payload)
+        except AppError:
+            message = None
+        route = self.router.route(sender, message)
+        if route.error is not None:
+            self._send(sender_peer, STREAM_CHAT, PacketType.ERROR, route.error)
+        for status in route.statuses:
+            self._send(sender_peer, STREAM_CHAT, PacketType.CHAT_STATUS, status)
+        for d in route.deliveries:
+            # Giữ lock qua send + ghi bảng + báo accepted: on_delivery (cần lock) không thể
+            # chạy trước khi bảng có delivery_id, và "accepted" luôn được xếp trước "delivered".
+            # transport.send chỉ xếp hàng, không block.
+            with self._lock:
+                try:
+                    delivery_id = self.transport.send(str(d.session_id), STREAM_CHAT,
+                                                      PacketType.CHAT, d.payload)
+                except AppError as exc:
+                    code = USER_OFFLINE if exc.code == "INVALID_SESSION" else "DELIVERY_TIMEOUT"
+                    status = chat_status(route.message_id, d.user_id, STATUS_FAILED, code)
+                else:
+                    self._chat[delivery_id] = (sender.session_id, route.message_id, d.user_id)
+                    status = chat_status(route.message_id, d.user_id, STATUS_ACCEPTED)
+                self._send(sender_peer, STREAM_CHAT, PacketType.CHAT_STATUS, status)
+
+    def _on_delivery(self, delivery_id: str) -> None:
+        with self._lock:
+            record = self._chat.pop(delivery_id, None)
+        if record is not None:
+            sender_sid, message_id, recipient_id = record
+            self._send(str(sender_sid), STREAM_CHAT, PacketType.CHAT_STATUS,
+                       chat_status(message_id, recipient_id, STATUS_DELIVERED))
+
+    def _on_failure(self, delivery_id: str, error_code: str) -> None:
+        with self._lock:
+            record = self._chat.pop(delivery_id, None)
+        if record is not None:
+            sender_sid, message_id, recipient_id = record
+            code = _FAILURE_TO_CHAT_ERROR.get(error_code, USER_OFFLINE)   # peer đóng/hết hạn
+            self._send(str(sender_sid), STREAM_CHAT, PacketType.CHAT_STATUS,
+                       chat_status(message_id, recipient_id, STATUS_FAILED, code))
+
+    # ----- presence ------------------------------------------------------------
+
+    def broadcast_user_list(self) -> None:
+        """Gửi snapshot USER_LIST (đủ các phần, cùng revision) cho mọi peer đã sẵn sàng."""
+        revision, users = self.sessions.online_snapshot()
+        parts = build_user_list_parts(revision, users)
+        with self._lock:
+            ready = list(self._ready)
+        for session_id in ready:
+            for part in parts:
+                self._send(str(session_id), STREAM_SESSION, PacketType.USER_LIST, part)
+
+    # ----- đóng phiên ------------------------------------------------------------
+
+    def _logout(self, session) -> None:
+        """LOGOUT đã được transport ACK; giữ khóa 60 s để ACK lại gói trùng, rồi xóa phiên."""
+        now = self._clock()
+        with self._lock:
+            crypto = self._crypto.pop(session.session_id, None)
+            self._tombstones = {sid: t for sid, t in self._tombstones.items() if t.expire_at > now}
+            if crypto is not None:
+                tx, rx = crypto
+                self._tombstones[session.session_id] = _LogoutTombstone(
+                    now + LOGOUT_TOMBSTONE_SECONDS, session.udp_addr, rx, tx)
+        log.info("%s đăng xuất", session.user_id)
+        self.sessions.remove_session(session.session_id)
+
+    def _get_tombstone(self, session_id: int):
+        with self._lock:
+            tomb = self._tombstones.get(session_id)
+            if tomb is not None and tomb.expire_at <= self._clock():
+                del self._tombstones[session_id]
+                return None
+            return tomb
+
+    def _ack_duplicate_logout(self, session_id: int, tomb, raw: bytes, address: tuple) -> None:
+        """ACK lại LOGOUT bị truyền lại; mọi gói khác của phiên đã logout bị bỏ."""
+        if address != tomb.address:
+            return
+        try:
+            packet = decode_packet(raw, tomb.rx)
+        except AppError:
+            return
+        h = packet.header
+        if h.packet_type != PacketType.LOGOUT or h.stream_id != STREAM_SESSION:
+            return
+        with self._lock:
+            seq = tomb.ack_seq
+            tomb.ack_seq += 1
+            wire = encode_packet(Header(PacketType.ACK, session_id, 0, seq, int(Flags.ENCRYPTED)),
+                                 encode_ack(h.stream_id, h.seq), tomb.tx)
+        self.transport.send_raw(wire, address)
+
+    def _on_peer_closed(self, peer_id: str, reason: str) -> None:
+        """Transport đóng peer (hết hạn heartbeat 15 s, lỗi stream 1/2...)."""
+        log.info("Peer %s đóng: %s", peer_id, reason)
+        self.sessions.remove_session(int(peer_id))
+
+    def _on_session_removed(self, session, reason: str) -> None:
+        """Phiên bị xóa (logout, hết hạn, mất kết nối): dọn peer và cập nhật online."""
+        session_id = session.session_id
+        with self._lock:
+            self._ready.discard(session_id)
+            self._crypto.pop(session_id, None)
+        self.router.forget_session(session_id)
+        try:
+            self.transport.close_peer(str(session_id), reason)
+        except AppError:
+            pass
+        if session.bound:
+            self.broadcast_user_list()
+
+    # ----- tiện ích ------------------------------------------------------------
+
+    def _send(self, peer_id: str, stream_id: int, kind: int, payload: bytes):
+        """Gửi reliable; peer đã đóng hoặc hàng đợi đầy thì chỉ ghi log."""
+        try:
+            return self.transport.send(peer_id, stream_id, kind, payload)
+        except AppError as exc:
+            log.debug("Không gửi được gói %s tới %s: %s", kind, peer_id, exc.code)
+            return None
+
+
+# ---------------------------------------------------------------------------
 # Dòng lệnh
 # ---------------------------------------------------------------------------
 
@@ -568,6 +814,17 @@ def main(argv=None) -> int:
     log.info("Đã nạp %d tài khoản từ %s; phiên chưa bind hết hạn sau %.1f giây",
              len(manager.accounts), accounts_path, manager.unbound_timeout)
 
+    try:
+        udp_sock = open_udp_socket(args.host, args.udp_port)
+    except OSError as exc:
+        log.error("Không mở được cổng UDP %s:%d: %s", args.host, args.udp_port, exc)
+        manager.stop()
+        return 1
+    transport = ServerUDP(udp_sock, role="server")
+    UdpService(manager, transport)
+    transport.start()
+    log.info("UDP đang lắng nghe %s:%d", args.host, udp_sock.getsockname()[1])
+
     server = CollabServer(manager, host=args.host, tcp_port=args.tcp_port,
                           udp_port=args.udp_port, ssl_context=ssl_context,
                           login_timeout=args.login_timeout)
@@ -577,8 +834,25 @@ def main(argv=None) -> int:
         log.error("Không mở được cổng %s:%d: %s", args.host, args.tcp_port, exc)
         return 1
     finally:
+        transport.close()
         manager.stop()
     return 0
+
+
+def open_udp_socket(host: str, port: int) -> socket.socket:
+    """Mở socket UDP cho cổng 9001.
+
+    Trên Windows, ``recvfrom`` báo ``ConnectionResetError`` mỗi khi trước đó gửi gói tới
+    một cổng đã đóng (client vừa tắt). Tắt hành vi này để vòng nhận không bị nhiễu.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if hasattr(socket, "SIO_UDP_CONNRESET"):
+        try:
+            sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+        except OSError:
+            pass
+    sock.bind((host, port))
+    return sock
 
 
 def _utf8_console():
