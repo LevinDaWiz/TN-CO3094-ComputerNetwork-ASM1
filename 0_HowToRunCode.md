@@ -73,6 +73,10 @@ python -m unittest tests.test_udp_service.EndToEndRealSocketTests -v
 python -m unittest tests.test_file_relay -v
 python -m unittest tests.test_file_relay.FileRelayRealSocketTests -v
 
+# Test tải: 20 client đồng thời bằng socket thật (TCP login -> UDP_BIND -> 20 người online ->
+# mỗi người nhận đủ 19 tin chung -> chat riêng theo vòng có delivered -> 10 người logout)
+python -m unittest tests.test_many_clients -v
+
 # ===== Truyền tệp (Người 4: file_transfer.py) =====
 
 # Test truyền tệp (server giả lập trong tests/, không phải server.py): mất/trùng/đảo gói + UDP thật
