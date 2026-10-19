@@ -22,9 +22,11 @@ python -m unittest test_protocol_transport.TransportTests.test_lost_ack -v
 # Tình trạng server (16/10):
 #   Đã chạy: đăng nhập TCP/TLS 9000; phiên + tài khoản demo; UDP 9001: UDP_BIND/UDP_BIND_OK,
 #            USER_LIST khi có người vào/ra, chat riêng/chung + CHAT_STATUS (accepted/delivered/failed),
+#            chuyển tiếp tệp A -> server -> B (luồng riêng, không chặn chat),
 #            heartbeat (15 s mất kết nối thì xóa khỏi online), LOGOUT.
-#   Chưa:    chuyển tiếp tệp qua server (đang làm; gói tệp hiện bị bỏ qua).
-#   Client thật (client.py) chưa có -> xem luồng đầy đủ bằng test end-to-end ở cuối mục này.
+#   Báo lỗi tệp: người nhận offline/mất kết nối -> người gửi nhận FILE_RESULT failed/USER_OFFLINE;
+#                người gửi mất kết nối -> người nhận nhận ERROR USER_OFFLINE.
+#   Client thật (client.py) chưa có -> xem luồng đầy đủ bằng các test end-to-end ở cuối mục này.
 
 # Tài khoản demo (không có đăng ký): user01..user20 / mật khẩu pass01..pass20
 # user_id tương ứng u01..u20. Mật khẩu chỉ để demo.
@@ -65,6 +67,11 @@ python -m unittest tests.test_udp_service -v
 
 # Test end-to-end bằng socket thật: TCP login -> UDP_BIND -> USER_LIST -> chat riêng -> delivered
 python -m unittest tests.test_udp_service.EndToEndRealSocketTests -v
+
+# Test chuyển tiếp tệp qua server thật (client là file_transfer.py của Người 4): mất/trùng/đảo gói,
+# từ chối, timeout, người nhận/người gửi mất kết nối, bên nhận chậm; có 1 test socket UDP thật
+python -m unittest tests.test_file_relay -v
+python -m unittest tests.test_file_relay.FileRelayRealSocketTests -v
 
 # ===== Truyền tệp (Người 4: file_transfer.py) =====
 

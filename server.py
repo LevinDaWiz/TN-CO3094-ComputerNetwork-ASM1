@@ -17,8 +17,10 @@ Phần UDP cổng 9001 (transport là ``server_udp.ServerUDP``):
 * ``build_user_list_parts``: USER_LIST phân trang <= 1149 byte (1b mục 8).
 * ``ChatRouter``: kiểm tra CHAT, chọn người nhận chat riêng/chung, chống trùng
   message_id, tạo payload có ``from``/``sent_at`` (1b mục 6).
+* ``FileRelay``: chuyển tiếp tệp giữa hai phiên (ánh xạ luồng, backpressure,
+  báo lỗi khi offline/mất kết nối theo bảng đã chốt với Người 4) (1b mục 7).
 * ``UdpService``: UDP_BIND/UDP_BIND_OK, USER_LIST khi online đổi, chat qua UDP
-  kèm CHAT_STATUS, heartbeat/timeout, LOGOUT. Chuyển tiếp tệp: bước sau.
+  kèm CHAT_STATUS, chuyển tiếp tệp, heartbeat/timeout, LOGOUT.
 
 Không ghi mật khẩu, khóa phiên hay nonce prefix vào log.
 """
@@ -44,6 +46,7 @@ from protocol import (MAX_PLAINTEXT, AppError, CryptoContext, Flags, Header,  # 
                       PacketType, decode_json, decode_packet, encode_ack, encode_json,
                       encode_packet, peek_header)
 from server_udp import ServerUDP
+from file_transfer import is_file_packet, validate_offer   # cùng luật kiểm tra offer với client (Người 4)
 
 log = logging.getLogger("server")
 
@@ -505,7 +508,227 @@ class ChatRouter:
 
 
 # ---------------------------------------------------------------------------
-# Dịch vụ UDP 9001: UDP_BIND, USER_LIST, chat, heartbeat, LOGOUT
+# Chuyển tiếp tệp (1b_protocol_spec.md mục 7)
+# ---------------------------------------------------------------------------
+
+RELAY_QUEUE_LIMIT = 4096      # gói chờ gửi tối đa mỗi luồng (~4 MiB chunk), vượt thì hủy tệp
+
+_SENDER_KINDS = frozenset((PacketType.FILE_CHUNK, PacketType.FILE_END, PacketType.ERROR))
+_RECEIVER_KINDS = frozenset((PacketType.FILE_ACCEPT, PacketType.FILE_REJECT,
+                             PacketType.FILE_RESULT, PacketType.ERROR))
+_FINAL_KINDS = frozenset((PacketType.FILE_REJECT, PacketType.FILE_RESULT, PacketType.ERROR))
+
+
+@dataclasses.dataclass
+class _FileLink:
+    """Một chặng của transfer: ``other`` là chặng bên kia ``(session_id, stream_id)``."""
+    other: tuple
+    transfer_id: object
+    is_sender: bool            # chặng này thuộc người gửi tệp
+
+
+class FileRelay:
+    """Chuyển tiếp FILE_* giữa hai phiên, không giữ cả tệp trong RAM.
+
+    * Mỗi transfer gồm hai chặng: ``(phiên gửi, luồng lẻ client mở)`` và
+      ``(phiên nhận, luồng chẵn server cấp)``; seq hai chặng độc lập.
+    * Gói được chuyển nguyên payload; chỉ FILE_OFFER được thêm ``from``.
+    * Gói cuối (FILE_REJECT/FILE_RESULT/ERROR): chuyển tiếp, xóa ánh xạ, đóng
+      chặng vừa nhận ngay; chặng kia đóng khi gói cuối đã được ACK.
+    * Mất kết nối (thống nhất với Người 4, khớp ``tests/fake_file_server.py``):
+      bên còn lại là người gửi -> ``FILE_RESULT failed/USER_OFFLINE``; là người
+      nhận -> ``ERROR USER_OFFLINE`` (``reference_id`` = transfer_id).
+    * Backpressure: hàng đợi riêng từng chặng; ``QUEUE_FULL`` thì chờ ACK rồi gửi
+      tiếp. Hàng đợi vượt ``queue_limit`` thì hủy tệp với ``DELIVERY_TIMEOUT``.
+
+    ``find_recipient(user_id) -> session_id | None`` trả phiên đã sẵn sàng nhận.
+    ``self._lock`` bảo vệ mọi bảng; ``transport.send`` chỉ xếp hàng nên được gọi
+    khi đang giữ lock (transport không gọi ngược vào đây khi đang giữ lock của nó).
+    """
+
+    def __init__(self, transport, find_recipient, *, queue_limit: int = RELAY_QUEUE_LIMIT):
+        self.transport = transport
+        self._find_recipient = find_recipient
+        self._queue_limit = queue_limit
+        self._lock = threading.Lock()
+        self._links = {}           # (sid, stream) -> _FileLink
+        self._queues = {}          # (sid, stream) -> deque[(kind, payload, final)]
+        self._sent = {}            # delivery_id -> ((sid, stream), final)
+
+    # ----- vào từ UdpService ----------------------------------------------
+
+    def handle_packet(self, sender, stream_id: int, kind: int, payload: bytes) -> None:
+        """Gói FILE_* hoặc ERROR trên luồng >= 3 từ phiên ``sender``."""
+        leg = (sender.session_id, stream_id)
+        with self._lock:
+            link = self._links.get(leg)
+            if link is None:
+                if kind == PacketType.FILE_OFFER:
+                    self._open_locked(sender, leg, payload)
+                return                         # gói muộn của tệp đã xong: bỏ
+            allowed = _SENDER_KINDS if link.is_sender else _RECEIVER_KINDS
+            if kind not in allowed:
+                log.debug("Bỏ gói tệp loại %s sai chiều từ %s", kind, sender.user_id)
+                return
+            other = link.other
+            final = kind in _FINAL_KINDS
+            if final:
+                self._links.pop(leg, None)
+                self._links.pop(other, None)
+                self._close_leg_locked(leg, "TRANSFER_DONE")
+            self._enqueue_locked(other, kind, payload, final)
+
+    def handle_delivery(self, delivery_id: str) -> bool:
+        """Gói relay đã được ACK. Trả False nếu delivery_id không thuộc relay."""
+        with self._lock:
+            record = self._sent.pop(delivery_id, None)
+            if record is None:
+                return False
+            leg, final = record
+            if final:
+                self._close_leg_locked(leg, "TRANSFER_DONE")
+            self._flush_all_locked()             # có chỗ trống: gửi tiếp hàng đợi
+        return True
+
+    def handle_failure(self, delivery_id: str, error_code: str) -> bool:
+        """Gói relay không tới được (hết lượt truyền lại, peer đóng...)."""
+        with self._lock:
+            record = self._sent.pop(delivery_id, None)
+            if record is None:
+                return False
+            leg, final = record
+            if final:
+                self._close_leg_locked(leg, error_code)
+            elif leg in self._links:
+                code = "DELIVERY_TIMEOUT" if error_code == "DELIVERY_TIMEOUT" else USER_OFFLINE
+                self._abort_locked(leg, code, leg_alive=False)
+            self._flush_all_locked()
+        return True
+
+    def handle_session_removed(self, session_id: int) -> None:
+        """Phiên mất: hủy mọi transfer có chặng thuộc phiên đó, báo bên còn lại."""
+        with self._lock:
+            for leg in [leg for leg in self._links if leg[0] == session_id]:
+                if leg in self._links:
+                    self._abort_locked(leg, USER_OFFLINE, leg_alive=False)
+            for leg in [leg for leg in self._queues if leg[0] == session_id]:
+                self._queues.pop(leg, None)
+
+    def active_links(self) -> int:
+        """Số chặng đang được ánh xạ (dùng cho test/giám sát)."""
+        with self._lock:
+            return len(self._links)
+
+    # ----- nội bộ (đang giữ lock) -----------------------------------------------
+
+    def _open_locked(self, sender, leg, payload: bytes) -> None:
+        try:
+            offer = decode_json(payload)
+        except AppError:
+            offer = {}
+        transfer_id = offer.get("transfer_id")
+
+        def refuse(code):
+            body = encode_json({"transfer_id": transfer_id if _is_uuid(transfer_id) else None,
+                                "status": "failed", "error_code": code})
+            self._enqueue_locked(leg, PacketType.FILE_RESULT, body, True)
+
+        try:
+            validate_offer(offer, require_from=False)   # cùng luật với client (Người 4)
+        except AppError as exc:
+            refuse(exc.code)
+            return
+        to = offer.get("to")
+        if not _is_user_id(to):
+            refuse(INVALID_PACKET)
+            return
+        target = self._find_recipient(to)
+        if target is None:
+            # Không phân biệt "không tồn tại" với "offline", giống chat riêng.
+            refuse(USER_OFFLINE)
+            return
+        try:
+            out_stream = self.transport.allocate_stream(str(target))    # chẵn từ 4
+        except AppError as exc:
+            refuse(USER_OFFLINE if exc.code == "INVALID_SESSION" else exc.code)
+            return
+        offer["from"] = sender.user_id                  # lấy từ phiên, không tin client
+        try:
+            body = encode_json(offer)
+        except AppError as exc:
+            refuse(exc.code)
+            return
+        out = (target, out_stream)
+        self._links[leg] = _FileLink(out, transfer_id, True)
+        self._links[out] = _FileLink(leg, transfer_id, False)
+        self._enqueue_locked(out, PacketType.FILE_OFFER, body, False)
+
+    def _enqueue_locked(self, leg, kind, payload: bytes, final: bool) -> None:
+        queue = self._queues.setdefault(leg, collections.deque())
+        if len(queue) >= self._queue_limit:
+            # Bên nhận quá chậm: không tích lũy thêm, hủy tệp và báo cả hai bên.
+            queue.clear()
+            if leg in self._links:
+                self._abort_locked(leg, "DELIVERY_TIMEOUT", leg_alive=True)
+            return
+        queue.append((kind, payload, final))
+        self._flush_leg_locked(leg)
+
+    def _flush_leg_locked(self, leg) -> None:
+        queue = self._queues.get(leg)
+        dead = False
+        while queue:
+            kind, payload, final = queue[0]
+            try:
+                delivery_id = self.transport.send(str(leg[0]), leg[1], kind, payload)
+            except AppError as exc:
+                if exc.code == "QUEUE_FULL":
+                    return                        # chờ ACK (handle_delivery) rồi gửi tiếp
+                queue.clear()                     # peer/luồng đã đóng
+                dead = True
+                break
+            queue.popleft()
+            self._sent[delivery_id] = (leg, final)
+        self._queues.pop(leg, None)
+        if dead and leg in self._links:
+            self._abort_locked(leg, USER_OFFLINE, leg_alive=False)
+
+    def _flush_all_locked(self) -> None:
+        for leg in list(self._queues):
+            self._flush_leg_locked(leg)
+
+    def _abort_locked(self, leg, code: str, *, leg_alive: bool) -> None:
+        """Hủy transfer chứa ``leg``; báo bên kia (và chính ``leg`` nếu còn sống)."""
+        link = self._links.pop(leg, None)
+        if link is None:
+            return
+        self._links.pop(link.other, None)
+        targets = [(link.other, not link.is_sender)]
+        if leg_alive:
+            targets.append((leg, link.is_sender))
+        else:
+            self._close_leg_locked(leg, code)
+        for target, target_is_sender in targets:
+            self._queues.pop(target, None)        # bỏ dữ liệu chưa gửi, chỉ gửi gói báo lỗi
+            if target_is_sender:
+                kind = PacketType.FILE_RESULT
+                body = encode_json({"transfer_id": link.transfer_id, "status": "failed",
+                                    "error_code": code})
+            else:
+                kind = PacketType.ERROR
+                body = error_payload(code, "Truyền tệp thất bại", link.transfer_id)
+            self._enqueue_locked(target, kind, body, True)
+
+    def _close_leg_locked(self, leg, reason: str) -> None:
+        self._queues.pop(leg, None)
+        try:
+            self.transport.close_stream(str(leg[0]), leg[1], reason)
+        except AppError:
+            pass                                   # peer đã đóng
+
+
+# ---------------------------------------------------------------------------
+# Dịch vụ UDP 9001: UDP_BIND, USER_LIST, chat, tệp, heartbeat, LOGOUT
 # ---------------------------------------------------------------------------
 
 LOGOUT_TOMBSTONE_SECONDS = 60.0     # 1b mục 8: ACK lại LOGOUT trùng trong 60 giây
@@ -536,6 +759,7 @@ class UdpService:
       15 s) và gửi USER_LIST cho mọi người.
     * CHAT (stream 2): ``ChatRouter`` chọn người nhận; gửi được vào hàng đợi thì báo
       người gửi ``accepted``, người nhận ACK thì ``delivered``, lỗi thì ``failed``.
+    * Gói tệp (stream >= 3): ``FileRelay`` chuyển tiếp giữa hai phiên.
     * LOGOUT (stream 1): xóa phiên; giữ khóa 60 giây để ACK lại LOGOUT trùng.
     * Peer hết hạn (heartbeat) hoặc phiên bị xóa ở đâu đó: đóng peer, cập nhật USER_LIST.
 
@@ -543,10 +767,12 @@ class UdpService:
     nhỏ của lớp này; không gọi callback khi đang giữ nó.
     """
 
-    def __init__(self, sessions, transport, *, router=None, clock=time.monotonic):
+    def __init__(self, sessions, transport, *, router=None, clock=time.monotonic,
+                 file_queue_limit: int = RELAY_QUEUE_LIMIT):
         self.sessions = sessions
         self.transport = transport
         self.router = router if router is not None else ChatRouter(sessions)
+        self.files = FileRelay(transport, self._find_ready_session, queue_limit=file_queue_limit)
         self._clock = clock
         self._lock = threading.Lock()
         self._ready = set()          # session_id đã nhận UDP_BIND_OK
@@ -614,8 +840,9 @@ class UdpService:
             self._logout(session)
         elif kind == PacketType.CHAT and stream_id == STREAM_CHAT:
             self._handle_chat(session, payload)
+        elif is_file_packet(stream_id, kind):
+            self.files.handle_packet(session, stream_id, kind, payload)
         else:
-            # Gói tệp (stream >= 3) sẽ được chuyển tiếp ở bước sau.
             log.debug("Bỏ qua gói loại %s trên stream %s từ %s", kind, stream_id, session.user_id)
 
     def _handle_chat(self, sender, payload: bytes) -> None:
@@ -648,7 +875,9 @@ class UdpService:
     def _on_delivery(self, delivery_id: str) -> None:
         with self._lock:
             record = self._chat.pop(delivery_id, None)
-        if record is not None:
+        if record is None:
+            self.files.handle_delivery(delivery_id)
+        else:
             sender_sid, message_id, recipient_id = record
             self._send(str(sender_sid), STREAM_CHAT, PacketType.CHAT_STATUS,
                        chat_status(message_id, recipient_id, STATUS_DELIVERED))
@@ -656,11 +885,21 @@ class UdpService:
     def _on_failure(self, delivery_id: str, error_code: str) -> None:
         with self._lock:
             record = self._chat.pop(delivery_id, None)
-        if record is not None:
+        if record is None:
+            self.files.handle_failure(delivery_id, error_code)
+        else:
             sender_sid, message_id, recipient_id = record
             code = _FAILURE_TO_CHAT_ERROR.get(error_code, USER_OFFLINE)   # peer đóng/hết hạn
             self._send(str(sender_sid), STREAM_CHAT, PacketType.CHAT_STATUS,
                        chat_status(message_id, recipient_id, STATUS_FAILED, code))
+
+    def _find_ready_session(self, user_id: str):
+        """session_id của ``user_id`` nếu đã bind và nhận UDP_BIND_OK, không thì None."""
+        session = self.sessions.get_session_by_user(user_id)
+        if session is None:
+            return None
+        with self._lock:
+            return session.session_id if session.session_id in self._ready else None
 
     # ----- presence ------------------------------------------------------------
 
@@ -727,6 +966,7 @@ class UdpService:
             self._ready.discard(session_id)
             self._crypto.pop(session_id, None)
         self.router.forget_session(session_id)
+        self.files.handle_session_removed(session_id)     # báo bên kia của các tệp dang dở
         try:
             self.transport.close_peer(str(session_id), reason)
         except AppError:
