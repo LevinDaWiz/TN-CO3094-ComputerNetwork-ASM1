@@ -21,6 +21,27 @@ def push_event(etype, data):
         STORE["events"].append({"event_id": eid, "type": etype, "data": data})
         del STORE["events"][:-10000]
         return eid
+    
+def find_or_add_user(username):
+    with LOCK:
+        for u in STORE["users"]:
+            if u["username"]==username:
+                return u
+        uid = f"u{len(STORE['users'])+1:02d}"
+        user = {"user_id": uid, "username": username}
+        STORE["users"].append(user)
+        STORE["revision"] += 1
+        return user
+
+def make_transfer(to, filename, size):
+    tid = str(uuid.uuid4())
+    with LOCK:
+        STORE["transfers"][tid] = {
+            "transfer_id": tid, "direction": "outgoing", 
+            "peer_id": to, "filename": filename, "size": size,
+             "status": "awaiting_upload", "bytes_done": 0,
+             "progress": 0, "error_code": None, "content":b"",}
+    return tid
 
 def ok(data):
     return {"ok": True, "data": data}
@@ -96,6 +117,35 @@ class Handler(BaseHTTPRequestHandler):
                 cursor = fresh[-1]["event_id"] if fresh else after
             self.send_json(200, ok({"events": fresh, "next_cursor": cursor}))
             return
+        if path == "/api/users":
+            with LOCK:
+                if STORE["state"] != "connected":
+                    self.send_json(401, err("NOT_LOGGED_IN", "Chưa đăng nhập"))
+                    return
+                self.send_json(200, ok({"revision": STORE["revision"], "users": STORE["users"],}))
+            return
+        if path =="/api/files":
+            with LOCK:
+                items = [{k: v for k, v in t.items()if k !="content"} for t in STORE["transfers"].values()]
+            self.send_json(200, ok({"transfers": items}))
+            return
+        if path.startswith("/api/files/") and path.endswith("/download"):
+            tid = path.split("/")[3]
+            with LOCK:
+                t = STORE["transfers"].get(tid)
+                if t is None or t["status"] not in ("offered", "accepted"):
+                    self.send_json(409, err("NOT_COMPLETED", "Chưa hoàn tất"))
+                    return
+                body = t["content"]
+                filename = t["filename"]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_json(404, err("NOT_FOUND", "Không tìm thấy"))
 
     def do_POST(self):
@@ -138,17 +188,113 @@ class Handler(BaseHTTPRequestHandler):
             push_event("connection_changed", {"state": "disconnected", "user": None, "error_code": None})
             self.send_json(200, ok({"status": "disconnected"}))
             return
+        if path =="/api/messages":
+            if not self.check_token():
+                self.send_json(403, err("FORBIDDEN", "Sai local token"))
+                return
+            body, error = self.read_json_body()
+            if error:
+                self.send_json(error[0], error[1])
+                return
+            import uuid as uuid_mod
+            with LOCK:
+                if STORE["state"] != "connected":
+                    self.send_json(401, err("NOT_LOGGED_IN", "Chưa đăng nhập"))
+                    return
+            to = body.get("to")
+            text = body.get("text") or ""
+            if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8"))>800:
+                self.send_json(400, err("INVALID_INPUT", "text rỗng hoặc vượt 800 byte UTF-8"))
+                return
+            mid = str(uuid_mod.uuid4())
+            push_event("message_status", {"message_id":mid, "recipient_id": to, "status": "delivered", "error_code": None,})
+            self.send_json(202, ok({"message_id": mid, "status": "queued"}))
+            return
+        if path == "/api/files/offers":
+            if not self.check_token():
+                self.send_json(403, err("FORBIDDEN", "Sai local token"))
+                return
+            body, error = self.read_json_body()
+            if error:
+                self.send_json(error[0], error[1])
+                return
+            with LOCK:
+                if STORE["state"] != "connected":
+                    self.send_json(401, err("NOT_LOGGED_IN", "Chưa đăng nhập"))
+                    return
+            to = body.get("to")
+            filename = (body.get("filename") or "").strip()
+            size = body.get("size")
+            if not to or not filename or not isinstance(size, int) or size < 0 or size > 100*1024*1024:
+                self.send_json(400, err("INVALID_INPUT", "to/filename/size sai"))
+                return
+            tid = make_transfer(to, filename, size)
+            self.send_json(201, ok({"transfer_id": tid, "status": "awaiting_upload"}))
+            return
+        if path.startswith("/api/files/") and (path.endswith("/accept") or path.endswith("/reject")):
+            if not self.check_token():
+                self.send_json(403, err("FORBIDDEN", "Sai local token"))
+                return
+            tid=path.split("/")[3]
+            with LOCK:
+                t = STORE["transfers"].get(tid)
+                if t is None:
+                    self.send_json(404, err("NOT_FOUND", "Không có transfer"))
+                    return
+            status = "accepted" if path.endswith("/accept") else "rejected"
+            with LOCK:
+                t["status"] = status
+            push_event("file_status", {"transfer_id": tid, "direction": t["direction"], "status": status, "error_code": None})
+            self.send_json(200, ok({"transfer_id": tid, "status": status}))
+            return
         self.send_json(404, err("NOT_FOUND", "Không tìm thấy"))
 
+    def do_PUT(self):
+        parsed =urlparse(self.path)
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) != 4 or parts[0] != "api" or parts[1] != "files" or parts[3] != "content":
+            self.send_json(404, err("NOT_FOUND", "Không tìm thấy"))
+            return
+        if not self.check_token():
+            self.send_json(403, err("FORBIDDEN", "Sai local token"))
+            return
+        tid = parts[2]
+        length =self.headers.get("Content-Length")
+        if length is None:
+            self.send_json(400, err("MISSING_LENGTH", "Thiếu Content-Length"))
+            return
+        n = int(length)
+        raw = self.rfile.read(n) if n>0 else b""
+        with LOCK:
+            t = STORE["transfers"].get(tid)
+            if t is None:
+                self.send_json(404, err("NOT_FOUND", "Không tìm thấy transfer_id"))
+                return
+            if t["status"] != "awaiting_upload":
+                self.send_json(409, err("INVALID_STATE", "Transfer không ở trạng thái upload"))
+                return
+            if len(raw) != t["size"]:
+                t["status"] = "failed"
+                t["error_code"] = "INVALID_INPUT"
+                self.send_json(409, err("SIZE_MISMATCH", "Kích thước body khác metadata"))
+                return
+            t["content"] = raw
+            t["status"] = "offered"
+            t["bytes_done"] = len(raw)
+            t["progress"] = 100 if raw else 0
+        push_event("file_offer", {"transfer_id": tid, "from": "u01", "filename": t["filename"], "size": t["size"]})
+        push_event("file_progress", {"transfer_id": tid, "direction": "outgoing", "bytes_done": t["bytes_done"], "total_bytes": t["size"], "progress": t["progress"]})
+        self.send_json(202, ok({"transfer_id": tid, "status": "offered"}))
+
 def fake_connect(username):
+    user = find_or_add_user(username)
     time.sleep(1.0)
     with LOCK:
         if STORE["state"] != "connecting":
             return
         STORE["state"] = "connected"
-        STORE["user"] = {"user_id": "u01", "username": username}
+        STORE["user"] = user
         STORE["last_error"] = None
-        user = STORE["user"]
     push_event("connection_changed", {"state": "connected", "user": user, "error_code": None})
     push_event("users_updated", {"revision": STORE["revision"], "users": STORE["users"]})
 
