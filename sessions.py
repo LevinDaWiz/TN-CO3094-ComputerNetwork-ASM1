@@ -1,34 +1,7 @@
-"""Quản lý tài khoản và phiên đăng nhập phía server (Người 2).
+"""Tài khoản demo và registry phiên đăng nhập phía server (Người 2).
 
-1. Tài khoản demo: đọc từ ``accounts.json`` (sinh bằng ``tools/make_accounts.py``).
-   Không có chức năng đăng ký. Mật khẩu chỉ lưu dạng hash PBKDF2-HMAC-SHA256
-   với salt ngẫu nhiên riêng cho từng tài khoản, so sánh bằng
-   ``hmac.compare_digest``. Không lưu, không log mật khẩu rõ.
-
-2. Registry phiên (``SessionManager``), hợp đồng ``1a_api.md`` mục 5::
-
-       authenticate(username: str, password: str) -> Session
-       bind_udp(session_id: int, address: tuple) -> None
-       list_online_users() -> list[dict]
-       remove_session(session_id: int) -> None
-
-   cùng ``get_session(session_id)``, ``get_session_by_user(user_id)``.
-   Mỗi tài khoản một phiên; phiên chưa bind UDP hết hạn sau 15 giây.
-
-Cách dùng phía server::
-
-    import sessions
-    sessions.init()                      # nạp accounts.json + chạy thread dọn phiên
-    s = sessions.authenticate("user01", "pass01")
-    sessions.bind_udp(s.session_id, ("192.168.1.5", 50000))
-
-Các hàm cấp module dùng manager mặc định do ``init()`` tạo (lần gọi đầu sẽ tự
-``init()``). Session trả ra là **bản sao**; muốn trạng thái mới thì gọi lại
-``get_session``. Không ghi khóa/mật khẩu vào log; ``repr(Session)`` ẩn khóa.
-
-``AppError`` dùng chung cả nhóm được định nghĩa trong ``protocol.py``; module này
-import lại để nơi khác có thể viết ``from sessions import AppError`` mà vẫn là
-cùng một lớp (``except AppError`` bắt được lỗi từ mọi module).
+Gồm: hash mật khẩu, ``AccountStore`` (tài khoản), ``SessionManager`` (phiên) và
+các hàm cấp module theo hợp đồng ``1a_api.md`` mục 5 (cuối file).
 """
 
 import base64
@@ -43,7 +16,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from protocol import AppError  # dùng lại, không định nghĩa lớp thứ hai
+# AppError của cả nhóm nằm ở protocol.py; import lại (không định nghĩa lớp thứ hai) để
+# ``from sessions import AppError`` vẫn là cùng một lớp và ``except AppError`` bắt được mọi module.
+from protocol import AppError
 
 # ---------------------------------------------------------------------------
 # Hằng số
@@ -84,7 +59,8 @@ _BAD_LOGIN_MESSAGE = "Sai tên đăng nhập hoặc mật khẩu"
 
 
 # ---------------------------------------------------------------------------
-# Hash mật khẩu
+# Hash mật khẩu: PBKDF2-HMAC-SHA256, salt ngẫu nhiên riêng từng tài khoản,
+# so sánh bằng hmac.compare_digest. Không lưu, không log mật khẩu rõ.
 # ---------------------------------------------------------------------------
 
 def _b64e(data: bytes) -> str:
@@ -146,7 +122,8 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Tài khoản
+# Tài khoản demo: đọc từ accounts.json (sinh bằng tools/make_accounts.py).
+# Không có chức năng đăng ký.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -158,6 +135,7 @@ class Account:
 
 
 def _validate_account(acc: Account) -> None:
+    """user_id ASCII 1..32 ký tự (1b mục 6), username 1..64 byte, hash đúng định dạng."""
     uid, name = acc.user_id, acc.username
     if not isinstance(uid, str) or not 1 <= len(uid) <= MAX_USER_ID_LEN \
             or not uid.isascii() or not uid.isprintable() or " " in uid:
@@ -294,10 +272,12 @@ def _validate_address(address) -> tuple:
 
 
 class SessionManager:
-    """Registry phiên, an toàn khi nhiều thread cùng gọi.
+    """Registry phiên, an toàn khi nhiều thread cùng gọi. Mỗi tài khoản một phiên.
 
     * ``_lock`` bảo vệ ``_by_id`` và ``_by_user``. Không giữ lock khi băm mật
       khẩu, làm I/O hay gọi callback.
+    * Mọi hàm trả ``Session`` đều trả **bản sao**; muốn trạng thái mới thì gọi lại
+      ``get_session``. ``repr(Session)`` ẩn khóa.
     * Phiên chưa bind quá ``unbound_timeout`` giây bị xóa bởi thread dọn dẹp
       (``start()``) hoặc khi gọi ``expire_unbound()`` thủ công (dùng trong test).
     * Phiên đã bind không bị thread này xóa: việc phát hiện mất kết nối (15 giây
@@ -333,6 +313,7 @@ class SessionManager:
         self._on_removed = callback
 
     def _notify_removed(self, removed) -> None:
+        """Ghi log và gọi callback cho từng ``(session, reason)``; gọi khi KHÔNG giữ lock."""
         callback = self._on_removed
         for session, reason in removed:
             log.info("Xóa phiên của %s (%s)", session.user_id, reason)
@@ -424,7 +405,7 @@ class SessionManager:
         if session is not None:
             self._notify_removed([(session, REASON_REMOVED)])
 
-    # ----- tiện ích cho các phần sau ---------------------------------------
+    # ----- tra cứu --------------------------------------------------------------
 
     def get_session(self, session_id: int):
         """Bản sao ``Session`` theo ``session_id``, hoặc ``None``."""
@@ -497,6 +478,7 @@ class SessionManager:
                 return candidate
 
     def _pop_locked(self, session_id):
+        """Gỡ phiên khỏi registry, tăng revision nếu phiên đó đang online."""
         session = self._by_id.pop(session_id, None)
         if session is not None and self._by_user.get(session.user_id) == session_id:
             del self._by_user[session.user_id]
@@ -506,7 +488,13 @@ class SessionManager:
 
 
 # ---------------------------------------------------------------------------
-# Manager mặc định và các hàm cấp module (hợp đồng 1a_api.md mục 5)
+# Manager mặc định và các hàm cấp module (hợp đồng 1a_api.md mục 5):
+#   authenticate(username, password) -> Session
+#   bind_udp(session_id, address) -> None
+#   list_online_users() -> list[dict]
+#   remove_session(session_id) -> None
+# cùng get_session, get_session_by_user, on_session_removed. Các hàm này dùng
+# manager mặc định do init() tạo (lần gọi đầu sẽ tự init()).
 # ---------------------------------------------------------------------------
 
 _manager = None
@@ -517,7 +505,11 @@ def init(accounts_path: str = None, *, unbound_timeout: float = UNBOUND_TIMEOUT,
          sweep_interval: float = SWEEP_INTERVAL, start: bool = True) -> SessionManager:
     """Tạo manager mặc định: nạp tài khoản và (mặc định) chạy thread dọn phiên.
 
-    Gọi lại sẽ thay manager cũ (manager cũ bị dừng thread dọn dẹp).
+    Gọi lại sẽ thay manager cũ (manager cũ bị dừng thread dọn dẹp). Ví dụ::
+
+        sessions.init()
+        s = sessions.authenticate("user01", "pass01")
+        sessions.bind_udp(s.session_id, ("192.168.1.5", 50000))
     """
     global _manager
     store = load_accounts(accounts_path) if accounts_path else get_account_store()

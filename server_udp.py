@@ -1,31 +1,4 @@
-"""Transport UDP phía server (Người 2), mở rộng ``reliable_udp.ReliableUDP``.
-
-Vấn đề: ``ReliableUDP.receive_datagram`` bỏ mọi gói của phiên chưa
-``register_peer``. Nhưng gói UDP_BIND đầu tiên luôn đến đúng lúc đó, vì server
-chỉ biết địa chỉ UDP của client SAU khi nhận UDP_BIND (1b_protocol_spec.md mục 2).
-
-Giải pháp, không sửa file của Người 1: lớp con ``ServerUDP`` thêm
-``on_unknown_datagram(callback)``. Gói có header hợp lệ nhưng phiên chưa đăng ký
-được chuyển cho callback; mọi gói khác đi nguyên đường của ``ReliableUDP``.
-
-Luồng UDP_BIND phía server::
-
-    def on_unknown(raw, address):
-        session = sessions.get_session(peek_header(raw).session_id)
-        if session is None or session.bound:
-            return                                   # bỏ, không ACK
-        rx = CryptoContext(session.c2s_key, session.c2s_nonce_prefix)
-        packet = decode_packet(raw, rx)              # sai khóa/tag -> AppError: bỏ
-        if packet.header.packet_type != PacketType.UDP_BIND or packet.header.stream_id != 1:
-            return
-        sessions.bind_udp(session.session_id, address)          # địa chỉ nguồn thực tế
-        transport.register_peer(str(session.session_id), session.session_id, address,
-                                CryptoContext(session.s2c_key, session.s2c_nonce_prefix), rx)
-        transport.receive_datagram(raw, address)     # lần này được ACK + giao lên on_payload
-
-Lưu ý: mỗi phiên chỉ tạo MỘT CryptoContext gửi (tx) cho mỗi chiều; tạo lại sẽ dùng
-lại nonce từ 0 và phá AES-GCM.
-"""
+"""Transport UDP phía server: ``ReliableUDP`` (Người 1) + nhận gói của phiên chưa đăng ký."""
 
 import logging
 
@@ -38,8 +11,15 @@ log = logging.getLogger("server_udp")
 class ServerUDP(ReliableUDP):
     """``ReliableUDP`` + callback cho gói của phiên chưa đăng ký (dùng cho UDP_BIND).
 
+    Vì sao cần: ``ReliableUDP.receive_datagram`` bỏ mọi gói của phiên chưa
+    ``register_peer``, mà gói UDP_BIND đầu tiên luôn đến đúng lúc đó (server chỉ
+    biết địa chỉ UDP của client SAU khi nhận UDP_BIND, 1b mục 2). Lớp con này
+    chuyển các gói đó cho ``on_unknown_datagram``; mọi gói khác đi nguyên đường
+    của ``ReliableUDP``. Không sửa file của Người 1.
+
     Khởi tạo y như ``ReliableUDP`` (thường ``ServerUDP(sock, role="server")``).
     Chỉ dùng thuộc tính công khai ``peers`` của lớp cha, không đụng lock/biến nội bộ.
+    Luồng xử lý UDP_BIND dùng lớp này nằm ở ``server.UdpService._on_unknown``.
     """
 
     def __init__(self, sock=None, **kwargs):

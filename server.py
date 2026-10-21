@@ -1,28 +1,13 @@
-"""Server cộng tác: đăng nhập qua TCP/TLS (cổng 9000) - Người 2.
+"""Server cộng tác (Người 2): đăng nhập TCP/TLS cổng 9000 + phiên, chat, tệp qua UDP 9001.
 
-Theo ``1b_protocol_spec.md`` mục 2:
+Các phần chính (theo thứ tự trong file):
 
-* Mỗi kết nối TCP chỉ dùng để đăng nhập: client gửi đúng một frame LOGIN,
-  server trả LOGIN_OK hoặc ERROR rồi đóng kết nối. Phiên sau đó được duy trì
-  qua UDP (cổng 9001, sẽ gắn thêm ở bước sau).
-* Framing ``[length: uint32 big-endian][JSON UTF-8]`` nằm trong ``framing.py``
-  (dùng chung với client).
-* Mỗi kết nối được xử lý trong một thread riêng. Mọi lỗi mạng chỉ làm hỏng
-  kết nối đó, không làm dừng server.
-* TLS bật mặc định vì LOGIN_OK chứa khóa AES của phiên; ``--no-tls`` chỉ dùng
-  để debug (giảng viên chưa xác nhận TLS có bắt buộc hay không).
-
-Phần UDP cổng 9001 (transport là ``server_udp.ServerUDP``):
-
-* ``build_user_list_parts``: USER_LIST phân trang <= 1149 byte (1b mục 8).
-* ``ChatRouter``: kiểm tra CHAT, chọn người nhận chat riêng/chung, chống trùng
-  message_id, tạo payload có ``from``/``sent_at`` (1b mục 6).
-* ``FileRelay``: chuyển tiếp tệp giữa hai phiên (ánh xạ luồng, backpressure,
-  báo lỗi khi offline/mất kết nối theo bảng đã chốt với Người 4) (1b mục 7).
-* ``UdpService``: UDP_BIND/UDP_BIND_OK, USER_LIST khi online đổi, chat qua UDP
-  kèm CHAT_STATUS, chuyển tiếp tệp, heartbeat/timeout, LOGOUT.
-
-Không ghi mật khẩu, khóa phiên hay nonce prefix vào log.
+* ``CollabServer``          đăng nhập TCP/TLS (1b mục 2)
+* ``build_user_list_parts`` USER_LIST phân trang (1b mục 8)
+* ``ChatRouter``            kiểm tra và chọn người nhận chat (1b mục 6)
+* ``FileRelay``             chuyển tiếp tệp giữa hai phiên (1b mục 7)
+* ``UdpService``            nối tất cả với transport UDP (``server_udp.ServerUDP``)
+* ``main``                  dòng lệnh: ``python server.py --help``
 """
 
 import argparse
@@ -46,7 +31,8 @@ from protocol import (MAX_PLAINTEXT, AppError, CryptoContext, Flags, Header,  # 
                       PacketType, decode_json, decode_packet, encode_ack, encode_json,
                       encode_packet, peek_header)
 from server_udp import ServerUDP
-from file_transfer import is_file_packet, validate_offer   # cùng luật kiểm tra offer với client (Người 4)
+# Dùng chung luật kiểm tra offer với client truyền tệp (Người 4), chỉ import, không sửa.
+from file_transfer import is_file_packet, validate_offer
 
 log = logging.getLogger("server")
 
@@ -72,11 +58,12 @@ ALREADY_LOGGED_IN = "ALREADY_LOGGED_IN"
 
 
 def error_message(code: str, message: str, reference_id=None) -> dict:
-    """Tạo thông điệp ERROR theo 1b_protocol_spec.md mục 9."""
+    """Frame ERROR trên TCP (dict, có ``type``), 1b mục 9. Bản UDP: ``error_payload``."""
     return {"type": "ERROR", "code": code, "message": message, "reference_id": reference_id}
 
 
 def _b64(data: bytes) -> str:
+    """Khóa/nonce prefix (bytes) -> chuỗi base64 cho LOGIN_OK."""
     return base64.b64encode(data).decode("ascii")
 
 
@@ -85,7 +72,12 @@ def _b64(data: bytes) -> str:
 # ---------------------------------------------------------------------------
 
 class CollabServer:
-    """Server đăng nhập TCP/TLS, mỗi kết nối một thread.
+    """Server đăng nhập TCP/TLS, mỗi kết nối một thread (1b mục 2).
+
+    Mỗi kết nối chỉ dùng để đăng nhập: client gửi đúng một frame LOGIN (framing ở
+    ``framing.py``), server trả LOGIN_OK hoặc ERROR rồi đóng TCP; phiên sau đó đi
+    qua UDP (``UdpService``, chạy riêng, xem ``main``). Mọi lỗi mạng chỉ làm hỏng
+    kết nối đó, không làm dừng server.
 
     ``session_backend`` là đối tượng (thường là ``sessions.SessionManager``) cung cấp:
 
@@ -95,7 +87,7 @@ class CollabServer:
       c2s_nonce_prefix, s2c_nonce_prefix`` (khóa dạng bytes).
     * ``remove_session(session_id)``: hủy phiên nếu gửi LOGIN_OK thất bại.
 
-    Phần UDP (cổng ``udp_port``) sẽ gắn vào ``start``/``stop`` ở bước sau.
+    ``ssl_context=None`` là không TLS (dùng trong test); ``main`` bật TLS mặc định.
     """
 
     def __init__(self, session_backend, host: str = DEFAULT_HOST,
@@ -220,7 +212,10 @@ class CollabServer:
             self._login_slots.release()
 
     def _process_login(self, sock: socket.socket, peer: str) -> None:
-        """Đọc frame LOGIN, xác thực và gửi LOGIN_OK hoặc ERROR."""
+        """Đọc frame LOGIN, xác thực và gửi LOGIN_OK hoặc ERROR.
+
+        Log chỉ ghi username và mã lỗi; không ghi mật khẩu, khóa phiên hay nonce prefix.
+        """
         try:
             msg = recv_frame(sock)
             username, password = self._parse_login(msg)
@@ -257,7 +252,10 @@ class CollabServer:
 
     @staticmethod
     def _parse_login(msg: dict):
-        """Kiểm tra cấu trúc LOGIN; trả về (username, password)."""
+        """Kiểm tra cấu trúc LOGIN; trả về (username, password).
+
+        Sai type/thiếu trường -> ``INVALID_PACKET``; quá dài -> ``PAYLOAD_TOO_LARGE``.
+        """
         if msg.get("type") != "LOGIN":
             raise AppError(INVALID_PACKET, "chỉ chấp nhận thông điệp LOGIN")
         username = msg.get("username")
@@ -272,6 +270,7 @@ class CollabServer:
     # ----- tiện ích đóng socket --------------------------------------------
 
     def _remove_session_quietly(self, session_id: int) -> None:
+        """Hủy phiên khi gửi LOGIN_OK thất bại; lỗi chỉ ghi log."""
         try:
             self.sessions.remove_session(session_id)
         except Exception:
@@ -300,6 +299,7 @@ class CollabServer:
 
     @staticmethod
     def _close_quietly(sock: socket.socket) -> None:
+        """Đóng socket, bỏ qua lỗi (socket có thể đã hỏng)."""
         try:
             sock.close()
         except OSError:
@@ -375,7 +375,7 @@ def chat_status(message_id: str, recipient_id, status: str, error_code=None) -> 
 
 
 def error_payload(code: str, message: str, reference_id=None) -> bytes:
-    """Payload ERROR (loại gói 14) ``{code, message, reference_id}``."""
+    """Payload gói UDP ERROR (loại 14) ``{code, message, reference_id}`` dạng bytes."""
     return encode_json({"code": code, "message": message, "reference_id": reference_id})
 
 
@@ -391,6 +391,7 @@ def _is_uuid(value) -> bool:
 
 
 def _is_user_id(value) -> bool:
+    """user_id hợp lệ: ASCII in được, không khoảng trắng, 1..32 ký tự (1b mục 6)."""
     return (isinstance(value, str) and 1 <= len(value) <= MAX_USER_ID_LEN
             and value.isascii() and value.isprintable() and " " not in value)
 
@@ -530,16 +531,8 @@ class _FileLink:
 class FileRelay:
     """Chuyển tiếp FILE_* giữa hai phiên, không giữ cả tệp trong RAM.
 
-    * Mỗi transfer gồm hai chặng: ``(phiên gửi, luồng lẻ client mở)`` và
-      ``(phiên nhận, luồng chẵn server cấp)``; seq hai chặng độc lập.
-    * Gói được chuyển nguyên payload; chỉ FILE_OFFER được thêm ``from``.
-    * Gói cuối (FILE_REJECT/FILE_RESULT/ERROR): chuyển tiếp, xóa ánh xạ, đóng
-      chặng vừa nhận ngay; chặng kia đóng khi gói cuối đã được ACK.
-    * Mất kết nối (thống nhất với Người 4, khớp ``tests/fake_file_server.py``):
-      bên còn lại là người gửi -> ``FILE_RESULT failed/USER_OFFLINE``; là người
-      nhận -> ``ERROR USER_OFFLINE`` (``reference_id`` = transfer_id).
-    * Backpressure: hàng đợi riêng từng chặng; ``QUEUE_FULL`` thì chờ ACK rồi gửi
-      tiếp. Hàng đợi vượt ``queue_limit`` thì hủy tệp với ``DELIVERY_TIMEOUT``.
+    Mỗi transfer gồm hai chặng: ``(phiên gửi, luồng lẻ client mở)`` và
+    ``(phiên nhận, luồng chẵn server cấp)``; seq hai chặng độc lập.
 
     ``find_recipient(user_id) -> session_id | None`` trả phiên đã sẵn sàng nhận.
     ``self._lock`` bảo vệ mọi bảng; ``transport.send`` chỉ xếp hàng nên được gọi
@@ -558,7 +551,13 @@ class FileRelay:
     # ----- vào từ UdpService ----------------------------------------------
 
     def handle_packet(self, sender, stream_id: int, kind: int, payload: bytes) -> None:
-        """Gói FILE_* hoặc ERROR trên luồng >= 3 từ phiên ``sender``."""
+        """Gói FILE_* hoặc ERROR trên luồng >= 3 từ phiên ``sender``.
+
+        Gói được chuyển nguyên payload sang chặng bên kia. Chặng người gửi chỉ được
+        gửi CHUNK/END/ERROR, chặng người nhận chỉ ACCEPT/REJECT/RESULT/ERROR.
+        Gói cuối (REJECT/RESULT/ERROR): xóa ánh xạ, đóng ngay chặng vừa nhận,
+        chặng kia đóng khi gói cuối đã được ACK (``handle_delivery``).
+        """
         leg = (sender.session_id, stream_id)
         with self._lock:
             link = self._links.get(leg)
@@ -622,6 +621,11 @@ class FileRelay:
     # ----- nội bộ (đang giữ lock) -----------------------------------------------
 
     def _open_locked(self, sender, leg, payload: bytes) -> None:
+        """FILE_OFFER mới: kiểm tra, mở luồng chẵn cho người nhận, thêm ``from`` rồi chuyển.
+
+        Offer hỏng -> ``FILE_RESULT failed/<mã>``; người nhận không sẵn sàng ->
+        ``FILE_RESULT failed/USER_OFFLINE`` (gửi lại cho người gửi trên chính luồng offer).
+        """
         try:
             offer = decode_json(payload)
         except AppError:
@@ -664,6 +668,13 @@ class FileRelay:
         self._enqueue_locked(out, PacketType.FILE_OFFER, body, False)
 
     def _enqueue_locked(self, leg, kind, payload: bytes, final: bool) -> None:
+        """Xếp gói vào hàng đợi riêng của chặng rồi gửi ngay nếu được.
+
+        Backpressure: transport báo ``QUEUE_FULL`` thì gói nằm lại hàng đợi, gửi tiếp
+        khi có ACK. Hàng đợi vượt ``queue_limit`` thì hủy tệp với ``DELIVERY_TIMEOUT``
+        (transport ACK ngay khi nhận nên không ghìm được người gửi; giới hạn hàng đợi
+        là cách để không tích lũy cả tệp trong RAM, 1b mục 7).
+        """
         queue = self._queues.setdefault(leg, collections.deque())
         if len(queue) >= self._queue_limit:
             # Bên nhận quá chậm: không tích lũy thêm, hủy tệp và báo cả hai bên.
@@ -675,6 +686,7 @@ class FileRelay:
         self._flush_leg_locked(leg)
 
     def _flush_leg_locked(self, leg) -> None:
+        """Gửi hàng đợi của chặng tới khi rỗng hoặc ``QUEUE_FULL``; chặng chết thì hủy tệp."""
         queue = self._queues.get(leg)
         dead = False
         while queue:
@@ -698,7 +710,13 @@ class FileRelay:
             self._flush_leg_locked(leg)
 
     def _abort_locked(self, leg, code: str, *, leg_alive: bool) -> None:
-        """Hủy transfer chứa ``leg``; báo bên kia (và chính ``leg`` nếu còn sống)."""
+        """Hủy transfer chứa ``leg``; báo bên kia (và chính ``leg`` nếu còn sống).
+
+        Bảng báo lỗi đã chốt với Người 4 (khớp ``tests/fake_file_server.py``):
+        bên được báo là người gửi -> ``FILE_RESULT failed/<code>``; là người nhận ->
+        ``ERROR <code>`` với ``reference_id`` = transfer_id. Mất kết nối dùng
+        ``USER_OFFLINE``.
+        """
         link = self._links.pop(leg, None)
         if link is None:
             return
@@ -720,6 +738,7 @@ class FileRelay:
             self._enqueue_locked(target, kind, body, True)
 
     def _close_leg_locked(self, leg, reason: str) -> None:
+        """Bỏ hàng đợi và đóng luồng của chặng trên transport."""
         self._queues.pop(leg, None)
         try:
             self.transport.close_stream(str(leg[0]), leg[1], reason)
@@ -750,18 +769,7 @@ class _LogoutTombstone:
 
 
 class UdpService:
-    """Logic UDP phía server, nối ``ServerUDP`` với registry phiên và ``ChatRouter``.
-
-    * UDP_BIND (gói đầu tiên của phiên, chưa có peer): xác thực bằng khóa c2s
-      của phiên, ``bind_udp`` với địa chỉ nguồn thực tế, ``register_peer``, rồi
-      đưa lại gói cho transport để được ACK và giao lên ``on_payload``.
-    * Sau UDP_BIND: trả UDP_BIND_OK, ``activate_peer`` (bật heartbeat 5 s, hết hạn
-      15 s) và gửi USER_LIST cho mọi người.
-    * CHAT (stream 2): ``ChatRouter`` chọn người nhận; gửi được vào hàng đợi thì báo
-      người gửi ``accepted``, người nhận ACK thì ``delivered``, lỗi thì ``failed``.
-    * Gói tệp (stream >= 3): ``FileRelay`` chuyển tiếp giữa hai phiên.
-    * LOGOUT (stream 1): xóa phiên; giữ khóa 60 giây để ACK lại LOGOUT trùng.
-    * Peer hết hạn (heartbeat) hoặc phiên bị xóa ở đâu đó: đóng peer, cập nhật USER_LIST.
+    """Logic UDP phía server: nối ``ServerUDP`` với registry phiên, ``ChatRouter`` và ``FileRelay``.
 
     Mọi callback chạy ngoài lock của transport. ``self._lock`` chỉ bảo vệ các bảng
     nhỏ của lớp này; không gọi callback khi đang giữ nó.
@@ -789,6 +797,14 @@ class UdpService:
     # ----- gói của phiên chưa có peer -------------------------------------
 
     def _on_unknown(self, raw: bytes, address: tuple) -> None:
+        """Gói của phiên chưa có peer (chạy trên thread nhận UDP).
+
+        Phiên vừa LOGOUT -> xử lý LOGOUT trùng. Còn lại chỉ nhận UDP_BIND:
+        1. tìm phiên theo ``session_id`` trong header; không có hoặc đã bind thì bỏ, không ACK;
+        2. giải mã bằng khóa c2s của phiên; sai khóa/tag thì bỏ;
+        3. ``bind_udp`` với địa chỉ nguồn thực tế, rồi ``register_peer``;
+        4. đưa lại đúng gói này cho transport: lần này được ACK và giao lên ``_on_payload``.
+        """
         try:
             session_id = peek_header(raw).session_id
         except AppError:
@@ -812,7 +828,8 @@ class UdpService:
             self.sessions.bind_udp(session_id, address)
         except AppError:
             return
-        # MỘT context gửi cho mỗi phiên; tạo lại sẽ dùng lại nonce từ 0.
+        # Chỉ tạo MỘT context gửi (tx) cho mỗi phiên: tạo lại thì counter về 0,
+        # dùng lại nonce và phá AES-GCM. Context nhận (rx) không có counter.
         tx = CryptoContext(session.s2c_key, session.s2c_nonce_prefix)
         try:
             self.transport.register_peer(str(session_id), session_id, address, tx, rx)
@@ -827,6 +844,13 @@ class UdpService:
     # ----- gói của peer đã đăng ký ------------------------------------------
 
     def _on_payload(self, peer_id: str, stream_id: int, kind: int, payload: bytes) -> None:
+        """Gói đã giải mã, đúng thứ tự, của peer đã đăng ký (peer_id = str(session_id)).
+
+        * UDP_BIND (stream 1): trả UDP_BIND_OK, ``activate_peer`` (heartbeat 5 s,
+          hết hạn 15 s), đánh dấu sẵn sàng rồi gửi USER_LIST cho mọi người.
+        * LOGOUT (stream 1) -> ``_logout``; CHAT (stream 2) -> ``_handle_chat``;
+          gói tệp (stream >= 3) -> ``FileRelay``.
+        """
         session = self.sessions.get_session(int(peer_id))
         if session is None:
             return                                    # đã logout/hết hạn: bỏ hoạt động mới
@@ -846,6 +870,13 @@ class UdpService:
             log.debug("Bỏ qua gói loại %s trên stream %s từ %s", kind, stream_id, session.user_id)
 
     def _handle_chat(self, sender, payload: bytes) -> None:
+        """CHAT trên stream 2: ``ChatRouter`` chọn người nhận rồi gửi đi.
+
+        Báo người gửi CHAT_STATUS: ``accepted`` khi xếp được vào hàng đợi transport,
+        ``delivered`` khi người nhận ACK (``_on_delivery``), ``failed`` khi lỗi.
+        Lỗi gửi ``INVALID_SESSION`` -> ``USER_OFFLINE``, lỗi khác (vd ``QUEUE_FULL``,
+        không có trong spec) -> ``DELIVERY_TIMEOUT``.
+        """
         sender_peer = str(sender.session_id)
         try:
             message = decode_json(payload)
@@ -873,6 +904,7 @@ class UdpService:
                 self._send(sender_peer, STREAM_CHAT, PacketType.CHAT_STATUS, status)
 
     def _on_delivery(self, delivery_id: str) -> None:
+        """Người nhận ACK: tin chat -> báo ``delivered``; còn lại là gói của ``FileRelay``."""
         with self._lock:
             record = self._chat.pop(delivery_id, None)
         if record is None:
@@ -883,6 +915,8 @@ class UdpService:
                        chat_status(message_id, recipient_id, STATUS_DELIVERED))
 
     def _on_failure(self, delivery_id: str, error_code: str) -> None:
+        """Gửi thất bại: tin chat -> ``failed`` (DELIVERY_TIMEOUT giữ nguyên, lý do
+        khác như peer đóng/hết hạn -> USER_OFFLINE); còn lại là gói của ``FileRelay``."""
         with self._lock:
             record = self._chat.pop(delivery_id, None)
         if record is None:
@@ -904,7 +938,11 @@ class UdpService:
     # ----- presence ------------------------------------------------------------
 
     def broadcast_user_list(self) -> None:
-        """Gửi snapshot USER_LIST (đủ các phần, cùng revision) cho mọi peer đã sẵn sàng."""
+        """Gửi snapshot USER_LIST (đủ các phần, cùng revision) cho mọi peer đã sẵn sàng.
+
+        Chỉ gửi cho peer đã nhận UDP_BIND_OK, nên client luôn thấy UDP_BIND_OK trước
+        USER_LIST. Gọi sau mỗi lần bind và mỗi khi một phiên đã bind bị xóa.
+        """
         revision, users = self.sessions.online_snapshot()
         parts = build_user_list_parts(revision, users)
         with self._lock:
@@ -929,6 +967,7 @@ class UdpService:
         self.sessions.remove_session(session.session_id)
 
     def _get_tombstone(self, session_id: int):
+        """Tombstone LOGOUT còn hạn của phiên, hoặc None (quá 60 s thì xóa luôn)."""
         with self._lock:
             tomb = self._tombstones.get(session_id)
             if tomb is not None and tomb.expire_at <= self._clock():
@@ -937,7 +976,12 @@ class UdpService:
             return tomb
 
     def _ack_duplicate_logout(self, session_id: int, tomb, raw: bytes, address: tuple) -> None:
-        """ACK lại LOGOUT bị truyền lại; mọi gói khác của phiên đã logout bị bỏ."""
+        """ACK lại LOGOUT bị truyền lại; mọi gói khác của phiên đã logout bị bỏ.
+
+        Chỉ nhận đúng địa chỉ cũ, đúng khóa. ACK được mã hóa bằng chính ``tx`` cũ
+        (counter chạy tiếp nên không trùng nonce) và gửi thô qua ``send_raw`` vì
+        peer đã đóng.
+        """
         if address != tomb.address:
             return
         try:
@@ -960,7 +1004,12 @@ class UdpService:
         self.sessions.remove_session(int(peer_id))
 
     def _on_session_removed(self, session, reason: str) -> None:
-        """Phiên bị xóa (logout, hết hạn, mất kết nối): dọn peer và cập nhật online."""
+        """Phiên bị xóa (logout, hết hạn, mất kết nối): dọn peer và cập nhật online.
+
+        Chỗ dọn duy nhất: mọi đường xóa phiên (logout, sweeper, peer timeout, lỗi gửi
+        LOGIN_OK) đều qua đây. ``remove_session``/``close_peer`` gọi lần hai không làm
+        gì, nên ``_on_peer_closed`` và hàm này không gọi nhau vô hạn.
+        """
         session_id = session.session_id
         with self._lock:
             self._ready.discard(session_id)
@@ -990,7 +1039,12 @@ class UdpService:
 # ---------------------------------------------------------------------------
 
 def build_tls_context(cert_file: str, key_file: str) -> ssl.SSLContext:
-    """Tạo SSLContext phía server, tối thiểu TLS 1.2."""
+    """Tạo SSLContext phía server, tối thiểu TLS 1.2.
+
+    TLS bật mặc định vì LOGIN_OK chứa khóa AES của phiên; ``--no-tls`` chỉ để debug
+    (giảng viên chưa xác nhận TLS có bắt buộc hay không). Chứng chỉ sinh bằng
+    ``tools/gen_cert.py``.
+    """
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
@@ -998,6 +1052,7 @@ def build_tls_context(cert_file: str, key_file: str) -> ssl.SSLContext:
 
 
 def parse_args(argv=None):
+    """Tham số dòng lệnh; host, cổng TCP/UDP và các timeout đều cấu hình được."""
     p = argparse.ArgumentParser(description="Server cộng tác CO3094 (đăng nhập TCP/TLS)")
     p.add_argument("--host", default=DEFAULT_HOST,
                    help="địa chỉ lắng nghe (mặc định %(default)s)")
@@ -1026,6 +1081,10 @@ def parse_args(argv=None):
 
 
 def main(argv=None) -> int:
+    """Khởi động server: TLS -> tài khoản + thread dọn phiên -> UDP 9001 -> TCP 9000.
+
+    Trả 0 khi dừng bằng Ctrl+C, 1 khi thiếu chứng chỉ/tài khoản hoặc không mở được cổng.
+    """
     args = parse_args(argv)
     logging.basicConfig(level=args.log_level,
                         format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s")
