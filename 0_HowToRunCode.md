@@ -73,3 +73,25 @@ python tools/file_transfer_demo.py
 python tools/file_transfer_demo.py --size-mib 100
 python tools/file_transfer_demo.py --file duong_dan_toi_tep.pdf
 
+# ===== Client + HTTP bridge (Người 3: client.py, messaging.py, http_bridge.py) =====
+
+# Mở app chat (cần bật server trước và có certs/ca.crt), vào trình duyệt http://127.0.0.1:8080
+python http_bridge.py
+
+# Người thứ hai trên cùng máy (mở terminal khác), vào http://127.0.0.1:8081
+python http_bridge.py --http-port 8081
+
+# Kết nối tới server ở máy khác trong LAN (chép certs/ca.crt từ máy server sang)
+python http_bridge.py --server-host 192.168.1.10 --ca-file certs/ca.crt
+
+# Xem các tùy chọn (cổng, thư mục lưu tệp nhận...)
+python http_bridge.py --help
+
+# Thử API bằng curl: lấy token -> đăng nhập (thay <token>) -> xem sự kiện mới
+curl http://127.0.0.1:8080/api/bootstrap
+curl -X POST http://127.0.0.1:8080/api/login -H "X-Local-Token: <token>" -H "Content-Type: application/json" -d "{\"username\":\"user01\",\"password\":\"pass01\"}"
+curl "http://127.0.0.1:8080/api/events?after=0"
+
+# Test client: đăng nhập, chat, gửi tệp với server thật + HTTP bridge
+python -m unittest tests.test_client -v
+
