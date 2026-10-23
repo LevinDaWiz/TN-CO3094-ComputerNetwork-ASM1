@@ -43,12 +43,11 @@ class Messenger:
 
     def send_message(self, to: str | None, text: str) -> str:
         """Xếp tin vào hàng gửi, trả message_id ngay (không chờ ACK)."""
-        me = self.client.require_connected()
+        self.client.require_connected()
         if to is not None:
             if not _is_id(to):
                 raise AppError("INVALID_INPUT", "'to' phải là user_id hoặc null")
-            if to == me["user_id"]:
-                raise AppError("INVALID_INPUT", "Không thể nhắn riêng cho chính mình")
+            # to == chính mình được phép (server coi như ghi chú), nên không chặn ở đây.
             if self.client.is_online(to) is False:
                 raise AppError("USER_OFFLINE", "Người nhận không trực tuyến")
         if not isinstance(text, str) or not text.strip():

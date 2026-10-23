@@ -4,7 +4,8 @@
 - Chỉ gọi facade ChatClient (client.py); không chạm tới TLS/UDP.
 - Request thay đổi trạng thái phải có X-Local-Token lấy từ GET /api/bootstrap.
 
-Chạy:  python3 http_bridge.py --server-host 127.0.0.1 --ca-file <ca.pem>
+Chạy:  python3 http_bridge.py                     (server 127.0.0.1, CA certs/ca.crt)
+       python3 http_bridge.py --server-host 192.168.1.10 --http-port 8081
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from dataclasses import dataclass
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from client import API_VERSION, MAX_FILE_SIZE, ChatClient, CursorExpired
+from file_transfer import FileTransferManager
 from protocol import AppError
 
 log = logging.getLogger(__name__)
@@ -235,6 +237,7 @@ class HttpBridge:
         self.local_token = secrets.token_urlsafe(32)
         self._sock: socket.socket | None = None
         self._stopping = threading.Event()
+        self.ready = threading.Event()        # set khi đã listen (port=0 → self.port là cổng thật)
 
         routes = [
             ("GET", "/api/bootstrap", self.h_bootstrap),
@@ -261,6 +264,8 @@ class HttpBridge:
         self._sock.bind((self.host, self.port))
         self._sock.listen(64)
         self._sock.settimeout(1.0)   # để vòng lặp kiểm tra cờ dừng định kỳ
+        self.port = self._sock.getsockname()[1]
+        self.ready.set()
         log.info("HTTP bridge: http://%s:%d", self.host, self.port)
         try:
             while not self._stopping.is_set():
@@ -465,11 +470,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Python client + HTTP bridge cho giao diện web")
     ap.add_argument("--server-host", default="127.0.0.1", help="địa chỉ server chat")
     ap.add_argument("--tcp-port", type=int, default=9000, help="cổng TCP/TLS đăng nhập")
-    ap.add_argument("--ca-file", help="chứng chỉ CA để xác minh TLS của server")
+    ap.add_argument("--ca-file", default=os.path.join(BASE_DIR, "certs", "ca.crt"),
+                    help="chứng chỉ CA để xác minh TLS của server (mặc định certs/ca.crt)")
     ap.add_argument("--server-name", help="tên trong chứng chỉ server (mặc định = --server-host)")
     ap.add_argument("--http-host", default="127.0.0.1")
     ap.add_argument("--http-port", type=int, default=8080)
     ap.add_argument("--web-dir", default=os.path.join(BASE_DIR, "web"))
+    ap.add_argument("--download-dir", default=os.path.join(BASE_DIR, "downloads"),
+                    help="nơi lưu tệp nhận được (mặc định downloads/)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -478,7 +486,7 @@ def main() -> None:
 
     client = ChatClient(args.server_host, args.tcp_port, ca_file=args.ca_file,
                         server_hostname=args.server_name)
-    # ⏳ khi file_transfer.py xong: client.attach_file_service(FileTransfer(client, ...))
+    client.attach_file_service(FileTransferManager(client, download_dir=args.download_dir))
 
     bridge = HttpBridge(client, args.http_host, args.http_port, static_dir=args.web_dir)
     try:

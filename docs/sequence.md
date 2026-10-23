@@ -123,7 +123,7 @@ sequenceDiagram
     end
 ```
 
-## 5. Gửi tệp (phần client; ⏳ chi tiết FILE_* do file_transfer.py)
+## 5. Gửi tệp (phần client; chi tiết FILE_* trong file_transfer.py của người 4)
 
 ```mermaid
 sequenceDiagram
@@ -131,7 +131,7 @@ sequenceDiagram
     participant UI
     participant HB as http_bridge
     participant CL as ChatClient
-    participant FT as file_transfer
+    participant FT as FileTransferManager
     participant SV as Server
 
     UI->>HB: POST /api/files/offers {to, filename, size}
@@ -141,7 +141,7 @@ sequenceDiagram
     HB->>CL: begin_upload() → đường dẫn tệp tạm
     Note over HB: ghi từng khúc xuống đĩa + tính SHA-256
     HB->>CL: submit_uploaded_file()
-    CL->>FT: offer_file(to, path, transfer_id)
+    CL->>FT: offer_file(to, path, transfer_id, filename, sha256, delete_source=True)
     HB-->>UI: 202 {status: "offered"}
     FT->>SV: FILE_OFFER → (chờ FILE_ACCEPT) → FILE_CHUNK… → FILE_END
     FT-->>UI: sự kiện file_progress / file_status / file_completed

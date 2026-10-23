@@ -208,12 +208,12 @@ class ChatClient:
                  server_hostname: str | None = None):
         self.server_host = server_host
         self.tcp_port = tcp_port
-        self.ca_file = ca_file                       # ⏳ chứng chỉ CA do người 2 cung cấp
+        self.ca_file = ca_file                       # certs/ca.crt do tools/gen_cert.py sinh
         self.server_hostname = server_hostname or server_host
 
         self.events = EventLog()
         self.messaging = Messenger(self)
-        self.files = None                            # ⏳ file_transfer.py (người 4)
+        self.files = None                            # FileTransferManager, gắn bằng attach_file_service
 
         self._lock = threading.RLock()
         self._state = DISCONNECTED
@@ -289,6 +289,8 @@ class ChatClient:
             deadline = time.monotonic() + LOGOUT_TIMEOUT + 1
             while self._state != DISCONNECTED and time.monotonic() < deadline:
                 time.sleep(0.05)
+        if self.files is not None:
+            self.files.close()
         shutil.rmtree(self._upload_dir, ignore_errors=True)
 
     def get_status(self) -> dict:
@@ -312,7 +314,7 @@ class ChatClient:
     # Bản ghi awaiting_upload do client giữ; sau khi offer ra mạng thì file module quản lý.
 
     def attach_file_service(self, service) -> None:
-        """⏳ Gắn đối tượng của file_transfer.py (người 4) khi module đó xong."""
+        """Gắn FileTransferManager của file_transfer.py (người 4)."""
         self.files = service
 
     def create_upload(self, to: str, filename: str, size: int) -> str:
@@ -358,8 +360,10 @@ class ChatClient:
             if up is None or not up.uploading:
                 raise AppError("INVALID_STATE", "Upload không hợp lệ")
         self.require_connected()
-        # ⏳ người 4: chữ ký trong 1a_api.md chưa có sha256 (bridge đã tính sẵn khi upload).
-        self._require_files().offer_file(up.to, temp_path, transfer_id)
+        # Tệp tạm đặt tên theo transfer_id nên phải truyền tên gốc; file module xoá
+        # tệp tạm khi transfer kết thúc (delete_source).
+        self._require_files().offer_file(up.to, temp_path, transfer_id, filename=up.filename,
+                                         sha256=sha256, delete_source=True)
         with self._lock:
             self._uploads.pop(transfer_id, None)
 
@@ -391,7 +395,7 @@ class ChatClient:
         return local + (list(self.files.list_transfers()) if self.files else [])
 
     def get_download_path(self, transfer_id: str) -> str:
-        # ⏳ người 4: 1a_api.md chưa có hàm tương ứng trong file_transfer.py, cần chốt.
+        """Chưa nhận xong → AppError INVALID_STATE (409), không có → TRANSFER_NOT_FOUND (404)."""
         return self._require_files().get_download_path(transfer_id)
 
     # ---- dùng bởi messaging.py / file_transfer.py ---------------------------
@@ -424,6 +428,14 @@ class ChatClient:
                 raise AppError("NOT_AUTHENTICATED", "Chưa đăng nhập")
             return self._session.transport.allocate_stream(SERVER_PEER)
 
+    def close_stream(self, stream_id: int, reason: str) -> None:
+        """Đóng luồng tệp đã xong; phiên đã đóng → AppError (file module tự bỏ qua)."""
+        with self._lock:
+            if self._session is None:
+                raise AppError("NOT_AUTHENTICATED", "Chưa đăng nhập")
+            transport = self._session.transport
+        transport.close_stream(SERVER_PEER, stream_id, reason)
+
     def emit(self, type_: str, data: dict) -> None:
         self.events.emit(type_, data)
 
@@ -455,6 +467,9 @@ class ChatClient:
 
     def _tls_login(self, username: str, password: str) -> dict:
         # Luôn xác minh chứng chỉ (spec cấm tắt); ca_file=None thì dùng CA hệ thống.
+        if self.ca_file and not os.path.isfile(self.ca_file):
+            raise AppError("CA_NOT_FOUND", f"Không có chứng chỉ CA {self.ca_file} "
+                                           "(chạy python tools/gen_cert.py hoặc chép ca.crt từ máy server)")
         context = ssl.create_default_context(cafile=self.ca_file)
         raw = socket.create_connection((self.server_host, self.tcp_port), timeout=LOGIN_TIMEOUT)
         try:
@@ -542,6 +557,11 @@ class ChatClient:
         for callback in pending:
             self._run_callback(callback, error_code or "PEER_CLOSED")
         self.messaging.reset()
+        if self.files is not None:
+            try:
+                self.files.handle_disconnect(error_code or "PEER_CLOSED")
+            except Exception:
+                log.exception("file_transfer.handle_disconnect lỗi")
         for transfer_id in uploads:
             try:
                 os.remove(os.path.join(self._upload_dir, transfer_id))
@@ -575,7 +595,8 @@ class ChatClient:
     def _handle_payload(self, session: _Session, peer_id: str, stream_id: int,
                         packet_type: int, payload: bytes) -> None:
         kind = PacketType(packet_type)
-        if kind in FILE_TYPES:
+        # FILE_* và ERROR trên luồng tệp (>= 3) thuộc file module.
+        if stream_id >= 3 and (kind in FILE_TYPES or kind == PacketType.ERROR):
             if self.files is not None:
                 self.files.handle_packet(peer_id, stream_id, packet_type, payload)
             return
