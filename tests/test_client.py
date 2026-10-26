@@ -383,7 +383,7 @@ class HttpBridgeTests(unittest.TestCase):
 
     def test_http_errors(self):
         self.assertEqual(self.call("GET", "/api/khong-co")[0], 404)
-        self.assertEqual(self.call("DELETE", "/api/status")[0], 405)
+        self.assertEqual(self.call("DELETE", "/api/status")[0], 400)
         self.assertEqual(self.call("GET", "/api/status", headers={"Host": "evil.com"})[0], 403)
         self.assertEqual(self.call("POST", "/api/messages", {"text": "x"},
                                    headers={"Origin": "http://evil.com"})[0], 403)

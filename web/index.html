@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coral Chat — CC v1</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=Quicksand:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/styles.css">
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+<div id="boot-error" role="alert" hidden></div>
+
+<!-- Màn hình đăng nhập -->
+<div id="login-screen">
+  <div class="login-card">
+    <div class="login-badge"><i data-lucide="waves"></i></div>
+    <h1>Coral Chat</h1>
+    <p class="login-sub">Đăng nhập để bắt đầu trò chuyện</p>
+    <div id="login-error" role="alert" hidden></div>
+    <form id="login-form">
+      <label>Tài khoản
+        <input id="username" name="username" autocomplete="username" placeholder="user01" required>
+      </label>
+      <label>Mật khẩu
+        <input id="password" name="password" type="password" autocomplete="current-password" placeholder="••••••" required>
+      </label>
+      <button type="submit" class="cta"><i data-lucide="log-in"></i> Đăng nhập</button>
+    </form>
+    <p class="login-hint">Tài khoản demo: user01/pass01 … user20/pass20</p>
+  </div>
+</div>
+
+<!-- App chính kiểu Discord -->
+<div id="app" hidden>
+  <!-- Cột trái: DM + online -->
+  <aside id="sidebar">
+    <div class="dm-search">
+      <i data-lucide="search"></i>
+      <input id="dm-filter" placeholder="Tìm hoặc bắt đầu cuộc trò chuyện">
+    </div>
+    <nav class="side-nav">
+      <button id="nav-friends" class="side-nav-item active"><i data-lucide="users"></i> Bạn bè</button>
+    </nav>
+    <div class="side-section">
+      <div class="side-section-head">
+        <span>Tin nhắn trực tiếp</span>
+        <button id="dm-refresh" title="Làm mới"><i data-lucide="refresh-cw"></i></button>
+      </div>
+      <p class="online-line"><span class="dot online"></span><span id="users-count">0</span> đang online</p>
+      <ul id="users"></ul>
+    </div>
+    <div id="me-card">
+      <div class="avatar" id="me-avatar">?</div>
+      <div class="me-info">
+        <strong id="me-name">—</strong>
+        <small id="me-sub">Chưa đăng nhập</small>
+      </div>
+      <button id="logout-btn" title="Đăng xuất"><i data-lucide="log-out"></i></button>
+    </div>
+  </aside>
+
+  <!-- Cột giữa: chat -->
+  <main id="chat">
+    <header id="chat-header">
+      <div class="chat-title">
+        <i data-lucide="hash" id="chat-hash"></i>
+        <span id="chat-name">general</span>
+        <span id="conn-pill" class="pill off"><span class="dot"></span><span id="conn-state">disconnected</span></span>
+      </div>
+      <div class="chat-tools">
+        <i data-lucide="bell"></i>
+        <i data-lucide="pin"></i>
+        <i data-lucide="users"></i>
+        <div class="chat-search"><input id="msg-filter" placeholder="Tìm kiếm"><i data-lucide="search"></i></div>
+      </div>
+    </header>
+
+    <div id="welcome">
+      <h2 id="welcome-title">Chào mừng đến với #general!</h2>
+      <p>Đây là khởi đầu của kênh chung này.</p>
+    </div>
+    <ul id="messages"></ul>
+
+    <div id="attach-menu" hidden>
+      <button id="attach-file"><i data-lucide="upload"></i> Tải Lên Tệp</button>
+      <input id="file-input" type="file" hidden>
+    </div>
+    <div id="composer">
+      <button id="plus-btn" title="Đính kèm"><i data-lucide="plus"></i></button>
+      <input id="msg-text" placeholder="Nhắn #general" autocomplete="off">
+      <span class="composer-icons">
+        <i data-lucide="gift"></i><i data-lucide="image"></i>
+        <i data-lucide="sticker"></i><i data-lucide="smile"></i>
+      </span>
+    </div>
+    <div id="error" role="alert" hidden></div>
+  </main>
+
+  <!-- Cột phải: trạng thái + hồ sơ -->
+  <aside id="rightbar">
+    <h3>Trạng thái kết nối</h3>
+    <div id="status-card">
+      <span class="dot" id="status-dot"></span>
+      <div>
+        <strong id="status-text">disconnected</strong>
+        <p id="status-detail">Chưa kết nối tới server.</p>
+      </div>
+    </div>
+    <h3 id="profile-head">Đang Hoạt Động</h3>
+    <div id="profile-card">
+      <div class="profile-banner"></div>
+      <div class="avatar big" id="profile-avatar">?</div>
+      <strong id="profile-name">Kênh chung</strong>
+      <small id="profile-sub">#general — tin nhắn tới mọi người online</small>
+      <ul id="transfers"></ul>
+    </div>
+  </aside>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

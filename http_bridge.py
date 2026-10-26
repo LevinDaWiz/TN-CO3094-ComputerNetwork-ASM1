@@ -38,20 +38,25 @@ CHUNK = 64 * 1024
 
 STATUS_TEXT = {200: "OK", 201: "Created", 202: "Accepted", 400: "Bad Request",
                401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
-               405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large",
-               500: "Internal Server Error", 501: "Not Implemented",
-               503: "Service Unavailable"}
+               409: "Conflict", 413: "Payload Too Large",
+               500: "Internal Server Error", 503: "Service Unavailable"}
 
-# AppError.code → HTTP status (1a_api.md §1). Mã không có trong bảng là lỗi đầu vào → 400.
+# AppError.code → HTTP status. Đúng 11 mã trong 1a_api.md §1:
+# 200 đọc/thành công; 201 tạo tài nguyên; 202 đã xếp hàng; 400 input sai;
+# 401 chưa đăng nhập; 403 local token sai; 404 không tìm thấy;
+# 409 trạng thái xung đột; 413 quá lớn; 500 lỗi nội bộ; 503 server không sẵn sàng.
+# Mã không có trong bảng là lỗi đầu vào → 400.
 ERROR_STATUS = {
-    "NOT_AUTHENTICATED": 401,
+    "NOT_AUTHENTICATED": 401, "INVALID_CREDENTIALS": 401, "LOGIN_FAILED": 401,
     "FORBIDDEN": 403, "INVALID_LOCAL_TOKEN": 403,
     "NOT_FOUND": 404, "TRANSFER_NOT_FOUND": 404,
-    "INVALID_STATE": 409, "USER_OFFLINE": 409, "EVENT_CURSOR_EXPIRED": 409,
+    "INVALID_STATE": 409, "ALREADY_LOGGED_IN": 409, "USER_OFFLINE": 409,
+    "EVENT_CURSOR_EXPIRED": 409,
     "TRANSFER_NOT_COMPLETED": 409,
     "PAYLOAD_TOO_LARGE": 413, "FILE_TOO_LARGE": 413,
-    "NOT_IMPLEMENTED": 501,
+    "IO_ERROR": 500, "NOT_IMPLEMENTED": 500,
     "SERVER_UNAVAILABLE": 503, "QUEUE_FULL": 503, "TRANSPORT_CLOSED": 503,
+    "CA_NOT_FOUND": 503,
     # Từ ReliableUDP khi peer vừa bị đóng / hết bộ đếm, trước khi client kịp về disconnected.
     "INVALID_SESSION": 503, "STREAM_CLOSED": 503, "SESSION_EXHAUSTED": 503,
 }
@@ -349,7 +354,7 @@ class HttpBridge:
     def _route(self, req: Request):
         if not req.path.startswith("/api/"):
             if req.method != "GET":
-                raise HttpError(405, "METHOD_NOT_ALLOWED", "Chỉ hỗ trợ GET cho tệp tĩnh")
+                raise HttpError(400, "INVALID_INPUT", "Chỉ hỗ trợ GET cho tệp tĩnh")
             return self._static(req.path)
 
         path_exists = False
@@ -369,7 +374,7 @@ class HttpBridge:
             except AppError as e:
                 raise HttpError(ERROR_STATUS.get(e.code, 400), e.code, e.message)
         if path_exists:
-            raise HttpError(405, "METHOD_NOT_ALLOWED", f"{req.method} không hỗ trợ")
+            raise HttpError(400, "INVALID_INPUT", f"{req.method} không hỗ trợ")
         raise HttpError(404, "NOT_FOUND", "Không có endpoint này")
 
     def _static(self, path: str) -> FileResult:
