@@ -76,6 +76,15 @@ h1, h2, h3, .chat-title { font-family: "Quicksand", "Be Vietnam Pro", sans-serif
 }
 #users li:hover { background: var(--bg); }
 #users li.active { background: var(--coral-soft); }
+#channels { list-style: none; margin: .5rem 0; padding: 0; }
+#channels li {
+  display: flex; gap: .6rem; align-items: center; padding: .5rem; border-radius: 8px; cursor: pointer;
+  font-weight: 600;
+}
+#channels li svg { width: 18px; height: 18px; color: var(--ink); }
+#channels li:hover { background: var(--bg); }
+#channels li:hover svg { color: var(--coral); }
+#channels li.active { background: var(--coral-soft); }
 #users .avatar { width: 32px; height: 32px; font-size: .9rem; }
 #users small { color: var(--ink-soft); }
 .avatar {
@@ -113,8 +122,10 @@ h1, h2, h3, .chat-title { font-family: "Quicksand", "Be Vietnam Pro", sans-serif
 .pill.busy { background: var(--yellow); color: var(--ink); }
 .pill.busy .dot { background: #e0a800; }
 .chat-tools { display: flex; gap: 1rem; align-items: center; }
+.chat-tools button { border: 0; background: transparent; cursor: pointer; padding: 0; }
 .chat-tools svg { width: 20px; height: 20px; color: var(--ink); }
-.chat-tools svg:hover { color: var(--coral); }
+.chat-tools button:hover svg { color: var(--coral); }
+.chat-tools button.muted svg { color: #adb5bd; }
 .chat-search { display: flex; gap: .4rem; align-items: center; background: var(--bg); border-radius: 8px; padding: .3rem .6rem; }
 .chat-search input { border: 0; background: transparent; outline: 0; font: inherit; width: 120px; }
 .chat-search svg { width: 16px; height: 16px; }
@@ -122,7 +133,10 @@ h1, h2, h3, .chat-title { font-family: "Quicksand", "Be Vietnam Pro", sans-serif
 #welcome h2 { margin: 0; }
 #welcome p { color: var(--ink-soft); }
 #messages { list-style: none; margin: 0; padding: 1rem; flex: 1; overflow-y: auto; }
-#messages li { display: flex; gap: .6rem; margin: .8rem 0; }
+#messages li { display: flex; gap: .6rem; margin: .8rem 0; max-width: 75%; }
+#messages li.own { margin-left: auto; flex-direction: row-reverse; }
+#messages li.own .body { background: var(--coral-soft); border-radius: 12px; padding: .4rem .8rem; }
+#messages li:not(.own) .body { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: .4rem .8rem; }
 #messages .body small { color: var(--ink-soft); margin-left: .5rem; }
 #messages .body p { margin: .2rem 0 0; }
 #messages .sys { color: var(--ink-soft); font-style: italic; }
@@ -142,6 +156,16 @@ h1, h2, h3, .chat-title { font-family: "Quicksand", "Be Vietnam Pro", sans-serif
 #composer svg { width: 20px; height: 20px; color: var(--ink); }
 #composer button:hover svg, .composer-icons svg:hover { color: var(--coral); }
 .composer-icons { display: flex; gap: .7rem; }
+.composer-icons button { border: 0; background: transparent; cursor: pointer; padding: 0; }
+#emoji-panel {
+  position: absolute; bottom: 90px; right: 320px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  padding: .6rem; display: grid; grid-template-columns: repeat(7, 1fr); gap: .25rem;
+  box-shadow: 0 8px 24px rgba(7,59,76,.15); z-index: 10;
+}
+#emoji-panel[hidden] { display: none; }
+#emoji-panel button { border: 0; background: transparent; font-size: 1.4rem; cursor: pointer; border-radius: 6px; }
+#emoji-panel button:hover { background: var(--coral-soft); }
 #error { margin: 0 1rem 1rem; background: var(--coral-soft); border-radius: 8px; padding: .5rem .8rem; }
 
 /* Cột phải */

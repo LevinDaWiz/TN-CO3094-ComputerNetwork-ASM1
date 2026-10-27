@@ -13,6 +13,9 @@ let target = null; // user_id DM; null = kenh chung #general
 let myId = null;
 let myName = "";
 let lastUsers = [];
+let pinned = new Set(); // user_id duoc ghim len dau
+let notifyOn = true;
+let unread = 0;
 
 const $ = (id) => document.getElementById(id);
 const icons = () => { if (window.lucide) lucide.createIcons(); };
@@ -65,6 +68,28 @@ function setLoggedIn(on, user) {
   icons();
 }
 
+const EMOJIS = ["😀","😁","😂","🤣","😊","😍","😎","😢","😡","👍","👎","🙏","👏","🎉","❤️","🔥","⭐","✅","❌","🤔","😅","🥳","😴","🤝","👋","💯"];
+function buildEmojiPanel() {
+  const panel = $("emoji-panel");
+  if (!panel || panel.dataset.built) return;
+  panel.dataset.built = "1";
+  for (const e of EMOJIS) {
+    const b = document.createElement("button");
+    b.type = "button"; b.textContent = e;
+    b.onclick = () => { $("msg-text").value += e; $("msg-text").focus(); };
+    panel.appendChild(b);
+  }
+}
+
+function flashTitle(text) {
+  if (!notifyOn || document.hasFocus()) return;
+  unread++;
+  document.title = `(${unread}) ${text}`;
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { unread = 0; document.title = "Coral Chat — CC v1"; }
+});
+
 function targetName() {
   if (!target) return null;
   const u = lastUsers.find((x) => x.user_id === target);
@@ -74,53 +99,104 @@ function targetName() {
 function renderChatHead() {
   const name = target ? "@" + targetName() : "general";
   $("chat-name").textContent = name;
+  $("chat-hash").setAttribute("data-lucide", target ? "at-sign" : "hash");
   $("msg-text").placeholder = target ? "Nhắn @" + targetName() : "Nhắn #general";
   $("welcome-title").textContent = target ? "Bắt đầu với " + targetName() : "Chào mừng đến với #general!";
+  const wsub = document.querySelector("#welcome p");
+  if (wsub) wsub.textContent = target ? "Đây là khởi đầu của cuộc trò chuyện riêng này." : "Đây là khởi đầu của kênh chung này.";
   $("profile-name").textContent = target ? targetName() : "Kênh chung";
   $("profile-sub").textContent = target ? "@" + targetName() + " — tin nhắn riêng" : "#general — tin nhắn tới mọi người online";
   $("profile-avatar").textContent = target ? (targetName()[0] || "?").toUpperCase() : "#";
+  const ch = $("ch-general");
+  if (ch) ch.classList.toggle("active", !target);
   icons();
 }
 
 function renderUsers(users) {
   lastUsers = users;
   const q = ($("dm-filter").value || "").toLowerCase();
+  const others = users.filter((x) => x.user_id !== myId);
   const ul = $("users");
   ul.innerHTML = "";
-  $("users-count").textContent = users.length;
-  for (const u of users.filter((x) => x.username.toLowerCase().includes(q))) {
+  $("users-count").textContent = others.length;
+  const sorted = others
+    .filter((x) => x.username.toLowerCase().includes(q))
+    .sort((a, b) => (pinned.has(b.user_id) ? 1 : 0) - (pinned.has(a.user_id) ? 1 : 0));
+  for (const u of sorted) {
     const li = document.createElement("li");
     if (u.user_id === target) li.classList.add("active");
     const av = document.createElement("div");
     av.className = "avatar"; av.textContent = u.username[0].toUpperCase();
     const tx = document.createElement("div");
-    const nm = document.createElement("div"); nm.textContent = u.username;
+    const nm = document.createElement("div"); nm.textContent = (pinned.has(u.user_id) ? "📌 " : "") + u.username;
     const sm = document.createElement("small"); sm.textContent = u.user_id;
     tx.append(nm, sm);
     li.append(av, tx);
-    li.onclick = () => { target = u.user_id; showError(""); renderUsers(lastUsers); renderChatHead(); };
+    li.onclick = () => { target = u.user_id; showError(""); renderUsers(lastUsers); renderChatHead(); renderHistory(); };
     ul.appendChild(li);
   }
   icons();
 }
 
-function addMessage(from, to, text, when) {
+function displayName(id) {
+  if (!id) return null;
+  if (id === myId) return myName || id;
+  const u = lastUsers.find((x) => x.user_id === id);
+  return u ? u.username : id;
+}
+
+const histories = { global: [] }; // key: "global" | peer user_id -> [{from,to,text,when}]
+function convKey() { return target || "global"; }
+
+function renderHistory() {
+  $("messages").innerHTML = "";
+  for (const m of histories[convKey()] || []) paintMessage(m.from, m.to, m.text);
+  scrollChat();
+}
+
+function scrollChat() {
+  const box = $("messages");
+  if (box) box.scrollTop = box.scrollHeight;
+}
+
+function storeMessage(from, to, text, when) {
+  // Tin chung (to=null) -> kenh #general; tin rieng -> DM voi peer (nguoi kia).
+  let key;
+  if (!to) key = "global";
+  else if (from === myId) key = to;
+  else if (to === myId) key = from;
+  else key = to;
+  if (!histories[key]) histories[key] = [];
+  const m = { from, to, text, when };
+  const last = histories[key][histories[key].length - 1];
+  if (last && last.from === from && last.to === to && last.text === text) return; // bo echo trung
+  histories[key].push(m);
+  if (key === convKey()) {
+    paintMessage(from, to, text);
+  } else if (key === "global") {
+    // co tin chung moi khi dang xem DM: bao nhe, khong chen lan
+    addSys("Có tin nhắn mới ở #general.");
+  }
+}
+
+function paintMessage(from, to, text) {
+  const fromName = displayName(from);
   const q = ($("msg-filter").value || "").toLowerCase();
-  if (q && !(from + " " + text).toLowerCase().includes(q)) return;
+  if (q && !(fromName + " " + text).toLowerCase().includes(q)) return;
   const li = document.createElement("li");
+  if (from === myId) li.classList.add("own");
   const av = document.createElement("div");
-  av.className = "avatar"; av.textContent = (from[0] || "?").toUpperCase();
+  av.className = "avatar"; av.textContent = (fromName[0] || "?").toUpperCase();
   const body = document.createElement("div");
   body.className = "body";
   const head = document.createElement("div");
-  const b = document.createElement("b"); b.textContent = from + (to ? " → " + to : "");
-  const sm = document.createElement("small"); sm.textContent = when || "";
-  head.append(b, sm);
+  const b = document.createElement("b"); b.textContent = fromName;
+  head.append(b);
   const p = document.createElement("p"); p.textContent = text;
   body.append(head, p);
   li.append(av, body);
   $("messages").appendChild(li);
-  li.scrollIntoView({ block: "end" });
+  scrollChat();
 }
 
 function addSys(text) {
@@ -128,6 +204,7 @@ function addSys(text) {
   li.className = "sys";
   li.textContent = text;
   $("messages").appendChild(li);
+  scrollChat();
 }
 
 function upsertTransfer(t) {
@@ -177,8 +254,8 @@ function handleEvent(ev) {
       break;
     case "users_updated": renderUsers(d.users); renderChatHead(); break;
     case "message_received": {
-      const toName = d.to ? (d.to === myId ? myName + " (bạn)" : d.to) : null;
-      addMessage(d.from, toName, d.text, (d.sent_at || "").replace("T", " ").slice(0, 16));
+      storeMessage(d.from, d.to, d.text, (d.sent_at || "").replace("T", " ").slice(0, 16));
+      flashTitle("Tin nhắn mới từ " + displayName(d.from));
       break;
     }
     case "message_status":
@@ -187,6 +264,7 @@ function handleEvent(ev) {
     case "file_offer":
       upsertTransfer({ transfer_id: d.transfer_id, direction: "incoming", filename: d.filename, size: d.size, status: "offered", progress: 0 });
       addSys("Tệp đến từ " + d.from + ": " + d.filename + " — xem cột phải để Nhận/Từ chối.");
+      flashTitle("Tệp đến từ " + displayName(d.from));
       break;
     case "file_status":
     case "file_progress":
@@ -230,6 +308,8 @@ async function sendText() {
   if (new TextEncoder().encode(text).length > 800) { showError("Tin nhắn vượt quá 800 byte UTF-8"); return; }
   try {
     await api("POST", "/api/messages", { to: target, text });
+    // Hien ngay tin minh gui; server echo lai qua event cung vao dung lich su kenh nay.
+    storeMessage(myId, target, text, "vừa xong");
     $("msg-text").value = "";
     showError("");
   } catch (err) { showError(err.message); }
@@ -275,11 +355,13 @@ async function init() {
   $("logout-btn").onclick = async () => {
     try { await api("POST", "/api/logout", {}); } catch (e) { showError(e.message); }
   };
+  const chGeneral = $("ch-general");
+  if (chGeneral) chGeneral.onclick = () => { $("nav-friends").click(); };
   $("nav-friends").onclick = () => {
     target = null; showError("");
     document.querySelectorAll(".side-nav-item").forEach((b) => b.classList.remove("active"));
     $("nav-friends").classList.add("active");
-    renderUsers(lastUsers); renderChatHead();
+    renderUsers(lastUsers); renderChatHead(); renderHistory();
   };
   $("dm-refresh").onclick = async () => {
     try { renderUsers((await api("GET", "/api/users")).users); } catch (e) { showError(e.message); }
@@ -287,6 +369,45 @@ async function init() {
   $("dm-filter").oninput = () => renderUsers(lastUsers);
   $("msg-filter").oninput = () => { /* loc cho tin tiep theo */ };
   $("msg-text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendText(); });
+  buildEmojiPanel();
+
+  $("pin-btn").onclick = () => {
+    if (!target) { showError("Hãy chọn một bạn để ghim"); return; }
+    if (pinned.has(target)) pinned.delete(target);
+    else pinned.add(target);
+    showError("");
+    renderUsers(lastUsers);
+  };
+  $("bell-btn").onclick = () => {
+    notifyOn = !notifyOn;
+    if (notifyOn) { unread = 0; document.title = "Coral Chat — CC v1"; }
+    $("bell-btn").classList.toggle("muted", !notifyOn);
+    showError(notifyOn ? "" : "Đã tắt thông báo tin nhắn mới");
+  };
+  $("img-btn").onclick = () => $("img-input").click();
+  $("img-input").onchange = () => {
+    const f = $("img-input").files[0];
+    if (f) sendFile(f);
+    $("img-input").value = "";
+  };
+  $("emoji-btn").onclick = (e) => {
+    e.stopPropagation();
+    const p = $("emoji-panel");
+    p.hidden = !p.hidden;
+  };
+  document.addEventListener("click", (e) => {
+    const p = $("emoji-panel");
+    if (!p || p.hidden) return;
+    if (!p.contains(e.target) && e.target !== $("emoji-btn") && !$("emoji-btn").contains(e.target)) {
+      p.hidden = true;
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      const p = $("emoji-panel");
+      if (p) p.hidden = true;
+    }
+  });
 
   const menu = $("attach-menu");
   $("plus-btn").onclick = () => { menu.hidden = !menu.hidden; };

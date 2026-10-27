@@ -46,6 +46,14 @@
     </nav>
     <div class="side-section">
       <div class="side-section-head">
+        <span>Kênh</span>
+      </div>
+      <ul id="channels">
+        <li id="ch-general" class="active"><i data-lucide="hash"></i> general</li>
+      </ul>
+    </div>
+    <div class="side-section">
+      <div class="side-section-head">
         <span>Tin nhắn trực tiếp</span>
         <button id="dm-refresh" title="Làm mới"><i data-lucide="refresh-cw"></i></button>
       </div>
@@ -71,8 +79,8 @@
         <span id="conn-pill" class="pill off"><span class="dot"></span><span id="conn-state">disconnected</span></span>
       </div>
       <div class="chat-tools">
-        <i data-lucide="bell"></i>
-        <i data-lucide="pin"></i>
+        <button id="bell-btn" title="Bật/tắt thông báo tin nhắn mới"><i data-lucide="bell"></i></button>
+        <button id="pin-btn" title="Ghim cuộc trò chuyện này lên đầu"><i data-lucide="pin"></i></button>
         <i data-lucide="users"></i>
         <div class="chat-search"><input id="msg-filter" placeholder="Tìm kiếm"><i data-lucide="search"></i></div>
       </div>
@@ -92,9 +100,11 @@
       <button id="plus-btn" title="Đính kèm"><i data-lucide="plus"></i></button>
       <input id="msg-text" placeholder="Nhắn #general" autocomplete="off">
       <span class="composer-icons">
-        <i data-lucide="gift"></i><i data-lucide="image"></i>
-        <i data-lucide="sticker"></i><i data-lucide="smile"></i>
+        <button id="img-btn" title="Gửi ảnh (.png, .jpg, .gif, .webp)"><i data-lucide="image"></i></button>
+        <button id="emoji-btn" title="Chèn emoji"><i data-lucide="smile"></i></button>
       </span>
+      <input id="img-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden>
+      <div id="emoji-panel" hidden></div>
     </div>
     <div id="error" role="alert" hidden></div>
   </main>
