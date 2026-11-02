@@ -2,7 +2,7 @@ Chạy 3 bước theo thứ tự — server trước, bridge sau, rồi mở tr�
 
 **1. Cài thư viện và sinh chứng chỉ (làm 1 lần):**
 ```
-python -m pip install -r 01_requirements.txt
+python -m pip install -r dependencies.txt
 python tools/gen_cert.py
 ```
 
